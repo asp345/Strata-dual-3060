@@ -24,7 +24,8 @@ answers, no questions), --setup (install another model / change settings instead
 --host 0.0.0.0 --api-key KEY (reach it from other devices on your network), --experimental-speed-projection on|off
 (EXPERIMENTAL, off by default),
 --models-dir DIR, --gguf-dir DIR (use GGUF files you already have), --build (compile instead of the ready-made
-engine), --check (only check this PC).
+engine), --gpus 0,1 (the GPUs to use; default: all cards of the same kind with 11 GB or more), --check (only check
+this PC).
 """
 from __future__ import annotations
 
@@ -1085,6 +1086,8 @@ def main() -> int:
     ap.add_argument("--port", type=int, help="the server's port (default: the one the install was set up with, 8080 for a new one)")
     ap.add_argument("--gpu", type=int, help="the GPU to use, numbered as nvidia-smi numbers them (default: the one with the "
                                             "most VRAM; with --setup it is saved, when starting it overrides the saved one)")
+    ap.add_argument("--gpus", help="the GPUs the model runs on, numbered as nvidia-smi numbers them (e.g. 0,1); default: "
+                                   "all of them when they are the same kind of card with 11 GB or more each")
     ap.add_argument("--host", help="where the server listens: 127.0.0.1 = this PC only (default), 0.0.0.0 = also other "
                                    "devices on your network (issue #26; set --api-key too)")
     ap.add_argument("--api-key", help="require this key from clients (recommended with --host 0.0.0.0)")
@@ -1229,7 +1232,25 @@ def main() -> int:
              "choose Q2_0 or IQ2_XS, or add RAM")
     ok(f"size: {model}")
     tag = fam["tag"] + model                           # names of the pack, config and start script
-    rec_ctx = 32768 if gpu["vram_gb"] < 14 else 65536 if gpu["vram_gb"] < 20 else 131072
+    # the GPUs the model runs on: every card the same kind as the first with 11 GB or more, split by layers (the
+    # engine's --gpus); only the native (IQ) packs run on more than one
+    native = not (model == "Q2_0" and avx512 and family == "qwen")
+    cards = {x["index"]: x for x in gpus()}
+    if a.gpus:
+        use = [int(x) for x in a.gpus.split(",")]
+        if any(i not in cards for i in use):
+            fail(f"--gpus {a.gpus}: this PC has GPUs " + ", ".join(str(i) for i in cards))
+        if len(use) > 1 and not native:
+            fail("Q2_0 with the AVX-512 kernel's expert pack runs on one GPU only; choose an IQ size for more GPUs")
+    elif a.gpu is None and native and len(cards) > 1 and \
+            all(x["arch"] == gpu["arch"] and x["vram_gb"] >= 11 for x in cards.values()):
+        use = sorted(cards)
+    else:
+        use = [gpu["index"]]
+    vram = sum(cards[i]["vram_gb"] for i in use)
+    if len(use) > 1:
+        ok(f"{len(use)} GPUs ({vram:.0f} GB of VRAM together): each runs a part of the model's layers")
+    rec_ctx = 32768 if vram < 14 else 65536 if vram < 20 else 131072
     if a.context:
         ctx = a.context
     else:
@@ -1404,6 +1425,8 @@ def main() -> int:
     elif ctx >= 65536 and ram >= MODELS[model]["ram_gb"] + kv_ram_gb + 1:
         args += ["--kv-resident", "32768"]
         ok(f"KV streaming on: the context's KV cache lives in RAM ({kv_ram_gb:.1f} GB), more experts fit in VRAM")
+    if len(use) > 1 or a.gpus:
+        args += ["--gpus", ",".join(str(i) for i in use)]
     if vision != "none":
         args += ["--vision", "--vram-reserve-mib", str(VISION[vision]["reserve_mib"])]
     if esp is not None:
@@ -1413,8 +1436,8 @@ def main() -> int:
     cfg = {"exe": str(eng / EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
            "model_name": f"{fam['name']}-{model.lower()}", "log": str(ROOT / f"strata-{tag.lower()}.log"),
            "lib_dirs": lib_dirs, "port": port}
-    if gpu["count"] > 1 or a.gpu is not None:
-        cfg["gpu"] = gpu["index"]                      # the engine is told this card (issue #51)
+    if len(use) == 1 and (gpu["count"] > 1 or a.gpu is not None):
+        cfg["gpu"] = use[0]                            # the engine is told this card (issue #51)
     if a.host:
         cfg["host"] = a.host
     if a.api_key:

@@ -65,10 +65,14 @@ public:
     /// **CHECKS THE ALLOCATION AGAINST WHAT THE CARD ACTUALLY HAS** rather than assuming the planner was right.
     /// A cache that silently allocates less than it was asked for would report a hit rate for slots it does
     /// not have, which is the shape of error this project keeps paying for.
-    bool open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int64_t blob_bytes, std::string& err);
+    /// The slots are on GPU `device`, and every call below that allocates or copies runs there.
+    bool open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int64_t blob_bytes, std::string& err,
+              int device = 0);
     /// Plan v0.3 P6: slots of the given sizes, back to back (a native pack's blobs differ per layer, and a
     /// profile-filled tier never moves an expert to another layer's slot, so each slot keeps its first size).
-    bool open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_layers, int64_t n_expert, std::string& err);
+    bool open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_layers, int64_t n_expert, std::string& err,
+                    int device = 0);
+    int device() const { return device_; }
     /// Byte offset of each slot in the arena (null for uniform slots).
     const uint64_t* slot_offsets() const { return off_.empty() ? nullptr : off_.data(); }
     void close();
@@ -136,6 +140,7 @@ public:
     int64_t fills() const { return fills_; }
 
 private:
+    int device_ = 0;
     uint8_t* base_ = nullptr;
     std::vector<int32_t> residency_;   ///< [n_layers * n_expert] -> slot or kNotResident
     int64_t slots_ = 0;

@@ -17,6 +17,10 @@
 // and the PLE history is set to its snapshot after token n_keep-1.  K/V cells past the accepted prefix are simply
 // overwritten when those positions are processed again, before any query can read them.
 //
+// GPUs.  With the layers split over GPUs (placement.hpp) the window is one captured graph per stage, launched
+// together: a stage waits on its own GPU for the previous stage's residual, which is handed on through mapped host
+// memory (no peer access is needed).  The host serves every layer's experts in order, whichever GPU runs it.
+//
 // Requires the default native decode configuration (native projections, fused GR, fused GDN, fast attention and
 // selection, native indexer) and a profile-filled VRAM expert tier with its residency table on the device.
 #pragma once
@@ -32,6 +36,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace strata::core {
 
@@ -89,9 +94,9 @@ public:
     /// Keep the first `n_keep` (1..T) tokens of the last window; advances `ss.ple_prev` by them.
     bool commit(int n_keep, std::string& err);
 
-    /// Token t's residual after the last layer, (hc, n_embd) on the device, valid until the next `run`.
+    /// Token t's residual after the last layer, (hc, n_embd) on the last stage's GPU, valid until the next `run`.
     const float* final_R(int t) const;
-    const float* final_R_all() const { return R_; }
+    const float* final_R_all() const { return stages_.back().R_; }
 
     /// The GPU plan the pool writes each layer (VRAM hits + the PCIe share of the misses); give it to the
     /// dispatch (`ExpertDispatch::plan`) before the first `run`.
@@ -109,6 +114,40 @@ public:
     int64_t windows = 0;
 
 private:
+    /// One pipeline stage's share of the window (placement.hpp): its layers [l0, l1), and the device buffers,
+    /// streams and captured graphs on its GPU.  The per-layer buffers hold the stage's own GDN and QSA layers,
+    /// indexed from its first ones (`gdn0`, `qsa0`).
+    struct Part {
+        int stage = 0, device = 0;
+        int64_t l0 = 0, l1 = 0, gdn0 = 0, qsa0 = 0, n_gdn = 0, n_qsa = 0;
+        cudaStream_t cs = nullptr;
+        cudaStream_t copy = nullptr;                              // the copy engine's stream (DMA of missed experts)
+        cudaGraphExec_t exec[9] = {};
+        cudaGraphExec_t commit_exec = nullptr;
+        void* arena = nullptr;
+        int32_t *tok_ = nullptr, *step_ = nullptr, *pos_ = nullptr, *commit_ = nullptr;
+        float *ple_ = nullptr, *emb_ = nullptr, *R_ = nullptr, *mixed_ = nullptr, *bo_ = nullptr;
+        float *inj_ = nullptr, *inj2_ = nullptr, *lo_ = nullptr, *rs_ = nullptr, *xn_ = nullptr;
+        uint8_t* xq_ = nullptr;                                   // T columns of q8_1
+        float *qkv_L_ = nullptr, *h_L_ = nullptr, *gate_L_ = nullptr, *beta_L_ = nullptr;   // per GDN layer
+        float *z_ = nullptr, *y_ = nullptr, *y_dummy_ = nullptr;
+        float *qfull_ = nullptr, *qcur_ = nullptr, *kcur_ = nullptr, *vcur_ = nullptr, *idx_raw_L_ = nullptr;
+        float *qidx_ = nullptr, *scores_ = nullptr, *attn_ = nullptr, *attn32_ = nullptr, *attn_scratch_ = nullptr;
+        float* tail_snap_ = nullptr;                              // per QSA layer
+        int32_t* sel_ = nullptr;
+        float *logits_ = nullptr, *w_ = nullptr, *shared_ = nullptr, *parts_ = nullptr, *hit_out_ = nullptr;
+        int32_t *ids_ = nullptr, *hit_slot_ = nullptr, *hit_dst_ = nullptr, *hit_count_ = nullptr;
+        int32_t* plan_ = nullptr;                                 // device copy of the plan block
+        uint8_t* staging_ = nullptr;                              // VRAM slots for the PCIe share of the misses
+        uint8_t* hit_xq_ = nullptr;
+        uint8_t* nat_xq_ = nullptr;   // plan v0.3 P6: q8_1 activations for a native pack's grouped experts
+        float* hit_xs_ = nullptr;
+        void* hit_scratch_ = nullptr;
+        float *head_mixed_ = nullptr, *head_inj_ = nullptr, *head_logits_ = nullptr;
+        uint16_t* sh_bf16_ = nullptr;
+        float *sh_gate_ = nullptr, *sh_up_ = nullptr, *sh_g_ = nullptr;
+        float* hist_snap_ = nullptr;                              // T * NG_HIST * NG_HC_DIM
+    };
     bool capture(int T, std::string& err);
     strata::kernels::SamplerParams sampling_ = [] {
         strata::kernels::SamplerParams s;
@@ -120,7 +159,9 @@ private:
     int hist_len_ = 0;
     bool head_sampling_ = true;          ///< set_head_sampling
     bool capture_commit(std::string& err);
-    bool record_window(int T, cudaStream_t cs, std::string& err);
+    bool record_window(int T, Part& P, std::string& err);
+    bool record_commit(Part& P, std::string& err);
+    Part& part_of(int64_t layer);
 
     const WeightTable* wt_ = nullptr;
     const ModelGeometry* g_ = nullptr;
@@ -132,9 +173,7 @@ private:
     int64_t last_pos0_ = 0;
     int32_t last_tokens_[8] = {};
     int64_t n_vocab_ = 0;
-    cudaStream_t cs_ = nullptr;
-    cudaGraphExec_t exec_[9] = {};
-    cudaGraphExec_t commit_exec_ = nullptr;
+    std::vector<Part> stages_;
 
     // mapped staging (host pointer, device alias)
     int32_t* h_tok_ = nullptr;   int32_t* m_tok_ = nullptr;     // T
@@ -150,7 +189,9 @@ private:
     uint32_t* h_flag_ = nullptr; uint32_t* m_flag_ = nullptr;
     uint32_t* h_flagA_ = nullptr; uint32_t* m_flagA_ = nullptr;  // the GPU plan is in place
     uint32_t* h_flagB_ = nullptr; uint32_t* m_flagB_ = nullptr;  // the PCIe share's DMA copies have landed
-    cudaStream_t copy_ = nullptr;                                 // the copy engine's stream (DMA of missed experts)
+    /// The residual stage s hands to stage s + 1 (T * hc * n_embd), and the flag that says it is in place.
+    std::vector<float*> h_hand_, m_hand_;
+    std::vector<uint32_t*> h_hand_flag_, m_hand_flag_;
     struct FlagSet { uint32_t* flag; uint32_t value; };
     FlagSet flag_sets_[2 * 64 * 2] = {};                          // host-function arguments, one per (layer, group)
     static void fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t bytes);
@@ -160,36 +201,12 @@ private:
     GpuPlanSink sink_;
     uint32_t cur_layer_ = 0;
     static void publish_plan(void* ctx);
-    void set_plan_slot(int grp);
+    void set_plan_slot(int64_t layer, int grp);
+    Part* cur_part_ = nullptr;                                    // the stage of the layer the pool is serving
     bool split_ = false;   // opt-in (--spec-split): exact but slower, see the overlap study
     int groups_[9] = {};
     float* h_ymiss_ = nullptr;   float* m_ymiss_ = nullptr;     // T * k * n_embd
-
-    // device
-    void* arena_ = nullptr;
-    int32_t *tok_ = nullptr, *step_ = nullptr, *pos_ = nullptr, *commit_ = nullptr;
-    float *ple_ = nullptr, *emb_ = nullptr, *R_ = nullptr, *mixed_ = nullptr, *bo_ = nullptr;
-    float *inj_ = nullptr, *inj2_ = nullptr, *lo_ = nullptr, *rs_ = nullptr, *xn_ = nullptr;
-    uint8_t* xq_ = nullptr;                                   // T columns of q8_1
-    float *qkv_L_ = nullptr, *h_L_ = nullptr, *gate_L_ = nullptr, *beta_L_ = nullptr;   // per GDN layer
-    float *z_ = nullptr, *y_ = nullptr, *y_dummy_ = nullptr;
-    float *qfull_ = nullptr, *qcur_ = nullptr, *kcur_ = nullptr, *vcur_ = nullptr, *idx_raw_L_ = nullptr;
-    float *qidx_ = nullptr, *scores_ = nullptr, *attn_ = nullptr, *attn32_ = nullptr, *attn_scratch_ = nullptr;
-    float* tail_snap_ = nullptr;                              // per QSA layer
-    int32_t* sel_ = nullptr;
-    float *logits_ = nullptr, *w_ = nullptr, *shared_ = nullptr, *parts_ = nullptr, *hit_out_ = nullptr;
-    int32_t *ids_ = nullptr, *hit_slot_ = nullptr, *hit_dst_ = nullptr, *hit_count_ = nullptr;
-    int32_t* plan_ = nullptr;                                     // device copy of the plan block
-    uint8_t* staging_ = nullptr;                                  // VRAM slots for the PCIe share of the misses
     static constexpr int64_t kStagingBlobs = 16;
-    uint8_t* hit_xq_ = nullptr;
-    uint8_t* nat_xq_ = nullptr;   // plan v0.3 P6: q8_1 activations for a native pack's grouped experts
-    float* hit_xs_ = nullptr;
-    void* hit_scratch_ = nullptr;
-    float *head_mixed_ = nullptr, *head_inj_ = nullptr, *head_logits_ = nullptr;
-    uint16_t* sh_bf16_ = nullptr;
-    float *sh_gate_ = nullptr, *sh_up_ = nullptr, *sh_g_ = nullptr;
-    float* hist_snap_ = nullptr;                              // T * NG_HIST * NG_HC_DIM
     int64_t cap_ = 0, max_blocks_ = 0, attn_scratch_floats_ = 0;
 };
 

@@ -47,5 +47,9 @@ void fused_gr_read(const FusedGrArgs& a, void* stream);
 /// token's outputs are bitwise `fused_gr_read(a[t])`.
 constexpr int kFusedGrMaxT = 8;
 void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream);
+/// The folded write alone, `R <- R + bo * 2 sigmoid(inj / hc)` with the arithmetic `fused_gr_read` applies it with,
+/// for `n_tok` tokens (R hc * n_embd, bo n_embd, inj hc per token): a pipeline stage's last layer, whose write has no
+/// next read on the same GPU to fold into.  A read with `apply = false` after it sees what a folding read computes.
+void fused_gr_write(float* R, const float* bo, const float* inj, int n_tok, void* stream);
 
 }  // namespace strata::kernels

@@ -25,25 +25,27 @@
 
 namespace strata::core {
 
+/// One GPU's share of a sequence (placement.hpp): the block scratch every layer of the stage reuses, and the
+/// stream the stage's state is zeroed on.  The per-layer state (GDN recurrences, QSA caches) lives in the stage's
+/// memory as well, reached through `SessionState::gdn_states` and `qsa_states`.
+struct SessionStage {
+    int device = 0;
+    cudaStream_t cs = nullptr;
+    GdnBuffers gdn;                 ///< the stage's GDN layers share one set of scratch; their STATE is per layer
+    QsaBuffers qsa_bufs;            ///< scratch, shared across the stage's QSA layers (they never run concurrently)
+    MoEBuffers moe;
+    BlockBuffers block;
+};
+
 /// Everything a sequence needs that is NOT a weight: the per-layer state, the block scratch, and the pinned
 /// handoff between the GPU and the CPU expert pool.
 struct SessionState {
     int64_t max_cells = 0;
 
-    GdnBuffers gdn;                 ///< the 36 GDN layers share one set of scratch; their STATE is per layer
-    float* gdn_state = nullptr;     ///< (n_gdn_layers, gdn_state_floats)
+    std::vector<SessionStage> stages;   ///< one per pipeline stage, in placement order
+    std::vector<float*> gdn_states;     ///< per GDN layer: `gdn_state_floats`, in its stage's memory
+    QsaState* qsa_states = nullptr;     ///< one per QSA layer, in its stage's memory
 
-    QsaState* qsa_states = nullptr;      ///< one per QSA layer
-    void* qsa_state_arena = nullptr;
-    QsaBuffers qsa_bufs;                 ///< scratch, shared across the 12 (they never run concurrently)
-    void* qsa_buf_arena = nullptr;
-
-    MoEBuffers moe;
-    void* moe_arena = nullptr;
-    BlockBuffers block;
-    void* block_arena = nullptr;
-
-    float* R = nullptr;             ///< alias of `block.R`, named for what it means at this level
     int64_t k = 10;                 ///< experts per token
     /// The doorbell the host loop polls.  Null until a caller provides one - the engine runs without it, and
     /// neither `session_token` nor `session_replay` looks at it.
@@ -73,15 +75,27 @@ struct SessionState {
     PleRun ple;
 };
 
-/// Bytes for a whole session at `max_cells` of context.  Every layer's state is sized at once, because P2.T10
+/// The floats one GDN layer's recurrent + conv state holds.
+uint64_t gdn_state_floats(const ModelGeometry& g);
+/// The layer of the i-th GDN layer and of the i-th QSA layer.
+int64_t gdn_layer_of(const ModelGeometry& g, int64_t gdn_index);
+int64_t qsa_layer_of(const ModelGeometry& g, int64_t qsa_index);
+
+/// Device bytes of pipeline stage `stage`'s share of a session at `max_cells` of context: its layers' state, the
+/// block scratch, and the PLE history where layer 1 is.  Every layer's state is sized at once, because P2.T10
 /// requires ZERO token-path allocations - a `cudaMalloc` that happened on the first token of a longer sequence
 /// would satisfy every test here and fail that one.
-uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k);
-/// Carves `base` (DEVICE memory) into `s`.  Returns the bytes used.
-uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void* base, SessionState& s);
+uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int stage);
+/// Carves `bases[s]` (DEVICE memory on stage s's GPU, `session_bytes` long) into `s` and creates each stage's
+/// stream.  False when a layer's state cannot be built (the pinned host copy of a streamed KV cache).
+bool session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, const std::vector<void*>& bases,
+                  SessionState& s);
 /// Zeroes every layer's state - the residual to `R_init`, everything else to zero, so a fresh sequence starts
-/// from the reference's own `zeros()`.
+/// from the reference's own `zeros()`.  The first stage's work is enqueued on `stream`; the other stages' is done
+/// on their own streams and has completed when this returns.
 void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, void* stream);
+/// Waits for every stage's GPU.
+bool session_sync(const SessionState& s);
 
 /// One token: layers 0..47 in order, each a `block_layer`, and the residual is updated in place.
 ///

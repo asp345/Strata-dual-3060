@@ -130,7 +130,9 @@ struct ExpertDispatch {
     // Everything below is per-session state rather than per-call, so the token path allocates nothing (P2.T10).
     const uint8_t* cache_base = nullptr;   ///< the slot arena on the DEVICE
     int64_t cache_blob = 0;                ///< bytes per slot
-    const uint64_t* cache_slot_off = nullptr;   ///< plan v0.3 P6: per-slot offsets when the slots differ in size
+    /// The verify window's plan: the device address of every slot of the VRAM tier (on its layer's GPU), indexed
+    /// by the residency table's slot numbers.
+    const uint64_t* slot_addr = nullptr;
     void* hit_scratch = nullptr;           ///< `moe_hit_grouped_scratch_bytes(K, ...)`
     float* parts_out = nullptr;            ///< the graph's `parts` buffer, on the device
     /// Where the GPU's hits land, `K x n_embd`, DEVICE and separate from `parts_out` on purpose: see
@@ -201,10 +203,11 @@ struct ExpertDispatch {
     std::vector<uint8_t> nact_multi;
     std::vector<strata::kernels::cpu::ExpertJobMulti> jobs_multi;
     std::vector<int16_t> job_of;
-    /// Plan v0.3 P6: the verify window's GPU plan (VRAM hits + the PCIe share of the misses); `pcie_num`/256 of
-    /// each layer's distinct missed experts (the last ones in routing order) are read by the GPU over PCIe.
+    /// Plan v0.3 P6: the verify window's GPU plan (VRAM hits + the PCIe share of the misses); `pcie_num[l]`/256 of
+    /// layer l's distinct missed experts (the last ones in routing order) are read by the GPU over PCIe - per layer,
+    /// because each layer's GPU reads them over its own link.  Empty = none.
     GpuPlanSink* plan = nullptr;
-    int pcie_num = 0;
+    std::vector<int> pcie_num;
     int64_t pcie_experts = 0;      ///< distinct experts the GPU read over PCIe in verify windows
     double ms_plan = 0, ms_actq = 0, ms_jobs = 0, ms_run = 0;   ///< verify-window dispatch sections
     /// Plan v0.3 P6: decayed routing counts per (layer, expert) during decode (sized by the caller; empty = off),

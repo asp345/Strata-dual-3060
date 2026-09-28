@@ -39,8 +39,8 @@ public:
     MtpDrafter(const MtpDrafter&) = delete;
     MtpDrafter& operator=(const MtpDrafter&) = delete;
 
-    /// Loads `rt_dir` (from tools/mtp_rt.py) and allocates the layer's K/V and buffers for up to `max_t` rows.
-    /// Call before the VRAM expert tier is sized: this takes ~0.9 GB.
+    /// Loads `rt_dir` (from tools/mtp_rt.py) and allocates the layer's K/V and buffers for up to `max_t` rows, on the
+    /// last pipeline stage's GPU (placement.hpp).  Call before the VRAM expert tier is sized: this takes ~0.9 GB.
     bool load(const std::string& rt_dir, const ModelGeometry& g, SessionState& ss, int max_t, std::string& err,
               int64_t window = 32768);
     /// The prompt's length: prefill() skips the cells the attention window can never reach again.
@@ -85,6 +85,7 @@ private:
 
     const ModelGeometry* g_ = nullptr;
     SessionState* ss_ = nullptr;
+    int device_ = 0;            ///< the last pipeline stage's GPU (placement.hpp)
     const WeightTable* wt_ = nullptr;
     const NativeHead* head_ = nullptr;
     const float* window_R_ = nullptr;

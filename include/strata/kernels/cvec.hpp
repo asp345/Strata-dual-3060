@@ -23,13 +23,10 @@
 namespace strata::kernels {
 
 struct Cvec {
-    const float* dir = nullptr;   ///< device, n_layers * n_embd: project = the unit v_l, add = d_l; zero rows elsewhere
-    const float* s = nullptr;     ///< device, n_layers: project = s_l, add = 1; 0 = the layer is not steered
-    const int* on = nullptr;      ///< device int: 0 = this request runs the stock model
     int mode = 0;                 ///< 0 = project, 1 = add
     int first = 0, last = -1;     ///< the steered layers, inclusive
     int64_t n_embd = 0, hc = 0;
-    bool loaded() const { return dir != nullptr; }
+    bool loaded() const { return !steered.empty(); }
     /// Layer l's FFN write is followed by the vector (with a real direction there).  Decided at load time, never
     /// per request: it changes where the residual write happens, so the graphs depend on it.
     bool covers(int64_t l) const { return loaded() && l >= first && l <= last && l < (int64_t) steered.size() && steered[(size_t) l]; }
@@ -39,11 +36,13 @@ struct Cvec {
 /// The loaded vector (empty until `cvec_upload`).
 const Cvec& cvec();
 
-/// Upload a vector built by the loader: `dir` is n_layers * n_embd, `s` n_layers (see `Cvec`).  Starts ON.
+/// Upload a vector built by the loader to each of `devices` (the GPUs its layers run on): `dir` is n_layers *
+/// n_embd - project mode the unit v_l, add mode d_l, zero rows elsewhere - and `s` n_layers - project s_l, add 1,
+/// 0 where a layer is not steered.  Starts ON.
 bool cvec_upload(const std::vector<float>& dir, const std::vector<float>& s, int mode, int first, int last,
-                 int64_t n_embd, int64_t hc, std::string& err);
+                 int64_t n_embd, int64_t hc, const std::vector<int>& devices, std::string& err);
 
-/// The per-request switch.  Synchronizes the device when it changes, so call it between requests.
+/// The per-request switch.  Synchronizes the GPUs when it changes, so call it between requests.
 void cvec_set_enabled(bool on);
 bool cvec_enabled();
 

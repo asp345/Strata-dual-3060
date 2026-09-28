@@ -7,6 +7,9 @@
 // walk the chunk inside one kernel, and the routed experts are grouped by expert: resident ones are read from the
 // VRAM tier, the others streamed from the host arena through a pinned ring on a copy stream.
 //
+// With the layers split over GPUs (placement.hpp) each stage runs its own layers of a chunk on its GPU, with its own
+// buffers, and the chunk's residual is copied to the next stage's GPU in between.
+//
 // Requires the native weights (`--native`): every quantized projection must carry its GGUF blocks.
 #pragma once
 
@@ -20,6 +23,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace strata::prefill {
 
@@ -41,16 +45,19 @@ public:
     Prefill(const Prefill&) = delete;
     Prefill& operator=(const Prefill&) = delete;
 
-    /// `host_res`: the static residency table (n_layers x n_expert, slot or -1) or null; `cache` its slots.
-    /// `borrow`/`borrow_bytes`: device memory to carve every buffer from (the top slots of the expert cache,
-    /// lent for the prompt and refilled after it); null = allocate normally.
-    bool init(const core::WeightTable& wt, const core::ModelGeometry& g, core::SessionState& ss,
-              core::ExpertSource* src, const core::ExpertCache* cache, const int32_t* host_res, int64_t chunk,
-              void* stream, std::string& err, void* borrow = nullptr, uint64_t borrow_bytes = 0);
+    /// Device memory a stage's buffers are carved from: the top slots of its GPU's expert cache, lent for the
+    /// prompt and refilled after it.  Null = allocate normally.
+    struct Borrow { void* base = nullptr; uint64_t bytes = 0; };
 
-    /// With borrowed buffers: lay them out again for chunks of `chunk` tokens (at most `init`'s) in `borrow` - a
-    /// request lends only the slots its prompt needs.  The stream must be idle (between prompts).
-    bool relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::string& err);
+    /// `host_res`: the static residency table (n_layers x n_expert, global slot or -1) or null; `slot_addr` the
+    /// device address of every slot, on its layer's GPU.  `borrow`: one per pipeline stage, or empty.
+    bool init(const core::WeightTable& wt, const core::ModelGeometry& g, core::SessionState& ss,
+              core::ExpertSource* src, const uint64_t* slot_addr, const int32_t* host_res, int64_t chunk,
+              std::string& err, const std::vector<Borrow>& borrow = {});
+
+    /// With borrowed buffers: lay them out again for chunks of `chunk` tokens (at most `init`'s) in `borrow` (one
+    /// per stage) - a request lends only the slots its prompt needs.  Called between prompts.
+    bool relayout(int64_t chunk, const std::vector<Borrow>& borrow, std::string& err);
     int64_t chunk() const;
 
     /// The share of the streamed experts' bytes DMA-able straight from pinned RAM (1 = all).  Sizes the streamed
@@ -58,8 +65,9 @@ public:
     static void set_pinned_share(double share);
     static double pinned_share();
 
-    /// Device bytes `init` needs for a chunk of `chunk` tokens (what a borrowed region must hold).
-    static uint64_t bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk);
+    /// Device bytes `init` needs on pipeline stage `stage`'s GPU for a chunk of `chunk` tokens (what its borrowed
+    /// region must hold).
+    static uint64_t bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk, int stage);
 
     /// Positions [pos0, pos0 + n) holding `tokens`; `ss.ple_prev` must be the two tokens before pos0 (oldest
     /// first, -1 for none) and is advanced to the last two of these.
@@ -67,10 +75,16 @@ public:
 
     const PrefillStats& stats() const { return stats_; }
 
-    /// Plan v0.3 P6: called after every chunk with the chunk's final multi-stream residual rows (device,
-    /// T x hc*n_embd, valid until the next chunk) and the chunk's first position; the MTP draft layer builds its
-    /// K/V from them.  The prefill stream is synchronized before the call.
+    /// Plan v0.3 P6: called after every chunk with the chunk's final multi-stream residual rows (device, on the last
+    /// stage's GPU, T x hc*n_embd, valid until the next chunk) and the chunk's first position; the MTP draft layer
+    /// builds its K/V from them.  The last stage's stream is synchronized before the call, which comes from that
+    /// stage's thread: with more than one GPU the stages before it may be working on the next chunk.
     std::function<bool(const float* R_rows, int64_t T, int64_t pos0, std::string& err)> on_chunk;
+
+    /// With more than one GPU: asked, in order, for the end position of every chunk; true = the first stage waits
+    /// until every stage has finished that chunk and `on_chunk` returned (where the callback reads every layer's
+    /// state, a conversation checkpoint).  Null = never.
+    std::function<bool(int64_t end)> hold_at;
 
     /// Checked before every chunk: true stops the prompt early (`run` returns false with err "cancelled").
     std::function<bool()> should_stop;
@@ -80,9 +94,9 @@ public:
     const float* const* embd_rows = nullptr;
 
 private:
-    bool carve(std::size_t T, void* alloc);   // the device buffers of a chunk (prefill.cpp's Alloc)
     struct Impl;
-    std::unique_ptr<Impl> impl_;
+    bool carve(Impl& m, std::size_t T, void* alloc);   // the device buffers of a chunk (prefill.cpp's Alloc)
+    std::vector<std::unique_ptr<Impl>> parts_;         // one per pipeline stage
     PrefillStats stats_;
 };
 

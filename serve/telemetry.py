@@ -28,7 +28,8 @@ class _Nvml:
     class Mem(ctypes.Structure):
         _fields_ = [("total", ctypes.c_ulonglong), ("free", ctypes.c_ulonglong), ("used", ctypes.c_ulonglong)]
 
-    def __init__(self, index=0):
+    def __init__(self, index=0, bus_id=None):
+        """GPU `index` in NVML's numbering, or the one at PCI bus id `bus_id` (as the engine's INFO names them)."""
         self.lib = self.dev = None
         names = ["nvml.dll", os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"),
                                           "NVIDIA Corporation", "NVSMI", "nvml.dll")] if os.name == "nt" \
@@ -47,8 +48,13 @@ class _Nvml:
                 self.lib = None
                 return
             h = ctypes.c_void_p()
-            get = getattr(self.lib, "nvmlDeviceGetHandleByIndex_v2", None) or self.lib.nvmlDeviceGetHandleByIndex
-            if get(ctypes.c_uint(index), ctypes.byref(h)) != 0:
+            if bus_id is not None:
+                get = getattr(self.lib, "nvmlDeviceGetHandleByPciBusId_v2", None) or self.lib.nvmlDeviceGetHandleByPciBusId
+                found = get(ctypes.c_char_p(bus_id.encode()), ctypes.byref(h))
+            else:
+                get = getattr(self.lib, "nvmlDeviceGetHandleByIndex_v2", None) or self.lib.nvmlDeviceGetHandleByIndex
+                found = get(ctypes.c_uint(index), ctypes.byref(h))
+            if found != 0:
                 self.lib = None
                 return
             self.dev = h
@@ -176,7 +182,8 @@ class Telemetry:
         self.lock = threading.Lock()
         self.now: dict = {}
         self.hist = collections.defaultdict(lambda: collections.deque(maxlen=HISTORY))
-        self.gpu = _Nvml(gpu_index)
+        self.gpus = [_Nvml(gpu_index)]
+        self.gpu_bus = None
         try:
             import psutil  # noqa: F401
             self.ps = sys.modules["psutil"]
@@ -184,7 +191,7 @@ class Telemetry:
             self.ps = None
         self.fallback = _CpuRamFallback()
         self.static = {
-            "gpu_name": self.gpu.name() if self.gpu.ok() else None,
+            "gpu_name": self.gpus[0].name() if self.gpus[0].ok() else None,
             "cpu_name": _cpu_name(),
             "cores": (self.ps.cpu_count(logical=False) if self.ps else None) or None,
             "threads": os.cpu_count(),
@@ -207,11 +214,43 @@ class Telemetry:
         dt = t - prev[0]
         return (c.read_bytes - prev[1]) / dt / 2**20, (c.write_bytes - prev[2]) / dt / 2**20
 
+    def use_gpus(self, bus_ids):
+        """The engine's GPUs (its INFO gpus=, PCI bus ids), in place of NVML's first one."""
+        if bus_ids == self.gpu_bus:
+            return
+        gpus = [_Nvml(bus_id=b) for b in bus_ids]
+        if not gpus or not all(g.ok() for g in gpus):
+            return
+        names = [g.name() or "?" for g in gpus]
+        if len(names) == 1:
+            name = names[0]
+        elif len(set(names)) == 1:
+            name = f"{len(names)} x {names[0]}"
+        else:
+            name = " + ".join(names)
+        with self.lock:
+            self.gpus, self.gpu_bus = gpus, bus_ids
+            self.static["gpu_name"] = name
+            self.static["gpu_count"] = len(gpus)
+
     def sample(self):
         s = {}
-        if self.gpu.ok():
-            g = self.gpu.read()
-            s.update({f"gpu_{k}": v for k, v in g.items()})
+        with self.lock:
+            gpus = list(self.gpus)
+        reads = [g.read() for g in gpus if g.ok()]
+        if len(reads) == 1:
+            s.update({f"gpu_{k}": v for k, v in reads[0].items()})
+        elif reads:
+            # several GPUs: the load averaged, memory, power and PCIe traffic summed, the hottest one's temperature,
+            # and each GPU's own figures
+            def vals(k):
+                return [r[k] for r in reads if r.get(k) is not None]
+            util = vals("util")
+            s["gpu_util"] = sum(util) / len(util) if util else None
+            for k in ("mem_used", "mem_total", "power", "power_limit", "pcie_rx_mb", "pcie_tx_mb"):
+                s[f"gpu_{k}"] = sum(vals(k)) if vals(k) else None
+            s["gpu_temp"] = max(vals("temp")) if vals("temp") else None
+            s["gpu_each"] = reads
         if self.ps:
             try:
                 s["cpu"] = self.ps.cpu_percent(interval=None)

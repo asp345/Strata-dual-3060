@@ -1,5 +1,6 @@
 // src/core/expert_cache.cpp - R4's slot storage and residency table.  Read the header first.
 #include "strata/core/expert_cache.hpp"
+#include "strata/core/placement.hpp"
 
 #include <cuda_runtime.h>
 
@@ -70,8 +71,10 @@ bool read_expert_profile(const std::string& path, int64_t n_layers, int64_t n_ex
 ExpertCache::~ExpertCache() { close(); }
 
 bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int64_t blob_bytes,
-                       std::string& err) {
+                       std::string& err, int device) {
     close();
+    device_ = device;
+    DeviceGuard dg(device_);
     if (n_slots <= 0) {
         err = "ExpertCache: n_slots must be positive";
         return false;
@@ -140,7 +143,7 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
 }
 
 bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_layers, int64_t n_expert,
-                             std::string& err) {
+                             std::string& err, int device) {
     if (slot_bytes.empty()) { err = "ExpertCache: no slots"; return false; }
     int64_t mx = 0;
     std::vector<uint64_t> off(slot_bytes.size() + 1, 0);
@@ -150,7 +153,7 @@ bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_l
         mx = slot_bytes[i] > mx ? slot_bytes[i] : mx;
     }
     // one allocation of the summed size, through the uniform path's checks: n "slots" of 1 byte
-    if (!open((int64_t) off.back(), n_layers, n_expert, 1, err)) return false;
+    if (!open((int64_t) off.back(), n_layers, n_expert, 1, err, device)) return false;
     slots_ = (int64_t) slot_bytes.size();
     blob_ = mx;
     off_ = std::move(off);
@@ -161,6 +164,7 @@ bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_l
 void ExpertCache::close() {
     off_.clear();
     if (base_ != nullptr) {
+        DeviceGuard dg(device_);
         cudaFree(base_);
         base_ = nullptr;
     }
@@ -256,6 +260,7 @@ bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std
         err = "ExpertCache::fill_slot_blocking: the host blob is null";
         return false;
     }
+    DeviceGuard dg(device_);
     const cudaError_t e = cudaMemcpy(dst, host_blob, n, cudaMemcpyHostToDevice);
     if (e != cudaSuccess) {
         err = std::string("ExpertCache::fill_slot_blocking: ") + cudaGetErrorString(e);
@@ -276,6 +281,7 @@ bool ExpertCache::verify_slot(int32_t slot, const uint8_t* host_blob, std::strin
     // has happened is not a check.  It also synchronises the fills queued before it, which is what makes the
     // comparison meaningful.
     std::vector<uint8_t> got((size_t) nb);
+    DeviceGuard dg(device_);
     const cudaError_t e = cudaMemcpy(got.data(), src, (size_t) nb, cudaMemcpyDeviceToHost);
     if (e != cudaSuccess) {
         err = std::string("ExpertCache::verify_slot: ") + cudaGetErrorString(e);

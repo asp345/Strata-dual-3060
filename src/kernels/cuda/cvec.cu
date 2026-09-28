@@ -12,8 +12,18 @@ constexpr int THREADS = 256;
 constexpr int MAXK = 16;   // n_embd up to 4096, held in registers between the dot and the update
 
 Cvec g_cvec;
-int* g_on = nullptr;
 bool g_on_host = false;
+/// The tables on one GPU: every GPU a steered layer can run on holds its own copy.
+struct DevTables { int device = -1; float* dir = nullptr; float* s = nullptr; int* on = nullptr; };
+std::vector<DevTables> g_dev;
+
+const DevTables* tables_here() {
+    int d = 0;
+    cudaGetDevice(&d);
+    for (const DevTables& t : g_dev)
+        if (t.device == d) return &t;
+    return nullptr;
+}
 
 // the fused hyper-connection read's gate (fused_gr.cu), so a write done here is bitwise the one it would have folded
 __device__ __forceinline__ float sigmoidf_(float x) { return 1.0f / (1.0f + __expf(-x)); }
@@ -75,24 +85,28 @@ __global__ void cvec_kernel(float* __restrict__ R, const float* __restrict__ dir
 const Cvec& cvec() { return g_cvec; }
 
 bool cvec_upload(const std::vector<float>& dir, const std::vector<float>& s, int mode, int first, int last,
-                 int64_t n_embd, int64_t hc, std::string& err) {
+                 int64_t n_embd, int64_t hc, const std::vector<int>& devices, std::string& err) {
     if (n_embd < 1 || n_embd > (int64_t) THREADS * MAXK) { err = "control vector: unsupported n_embd"; return false; }
     if (s.empty() || dir.size() != s.size() * (size_t) n_embd) { err = "control vector: bad table sizes"; return false; }
-    float* d_dir = nullptr;
-    float* d_s = nullptr;
-    int* d_on = nullptr;
+    int prev = 0;
+    cudaGetDevice(&prev);
     const int one = 1;
-    if (cudaMalloc(&d_dir, dir.size() * sizeof(float)) != cudaSuccess ||
-        cudaMalloc(&d_s, s.size() * sizeof(float)) != cudaSuccess || cudaMalloc(&d_on, sizeof(int)) != cudaSuccess ||
-        cudaMemcpy(d_dir, dir.data(), dir.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess ||
-        cudaMemcpy(d_s, s.data(), s.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess ||
-        cudaMemcpy(d_on, &one, sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) {
-        err = "control vector: device allocation failed";
-        return false;
+    for (int d : devices) {
+        DevTables t;
+        t.device = d;
+        if (cudaSetDevice(d) != cudaSuccess ||
+            cudaMalloc(&t.dir, dir.size() * sizeof(float)) != cudaSuccess ||
+            cudaMalloc(&t.s, s.size() * sizeof(float)) != cudaSuccess || cudaMalloc(&t.on, sizeof(int)) != cudaSuccess ||
+            cudaMemcpy(t.dir, dir.data(), dir.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess ||
+            cudaMemcpy(t.s, s.data(), s.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess ||
+            cudaMemcpy(t.on, &one, sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) {
+            cudaSetDevice(prev);
+            err = "control vector: device allocation failed";
+            return false;
+        }
+        g_dev.push_back(t);
     }
-    g_cvec.dir = d_dir;
-    g_cvec.s = d_s;
-    g_cvec.on = d_on;
+    cudaSetDevice(prev);
     g_cvec.mode = mode;
     g_cvec.first = first;
     g_cvec.last = last;
@@ -100,26 +114,33 @@ bool cvec_upload(const std::vector<float>& dir, const std::vector<float>& s, int
     g_cvec.hc = hc;
     g_cvec.steered.assign(s.size(), false);
     for (size_t l = 0; l < s.size(); ++l) g_cvec.steered[l] = s[l] != 0.0f;
-    g_on = d_on;
     g_on_host = true;
     return true;
 }
 
 void cvec_set_enabled(bool on) {
-    if (g_on == nullptr || on == g_on_host) return;
-    cudaDeviceSynchronize();   // nothing in flight may still read the flag
+    if (g_dev.empty() || on == g_on_host) return;
+    int prev = 0;
+    cudaGetDevice(&prev);
     const int v = on ? 1 : 0;
-    cudaMemcpy(g_on, &v, sizeof(int), cudaMemcpyHostToDevice);
+    for (const DevTables& t : g_dev) {
+        cudaSetDevice(t.device);
+        cudaDeviceSynchronize();   // nothing in flight may still read the flag
+        cudaMemcpy(t.on, &v, sizeof(int), cudaMemcpyHostToDevice);
+    }
+    cudaSetDevice(prev);
     g_on_host = on;
 }
 
-bool cvec_enabled() { return g_on != nullptr && g_on_host; }
+bool cvec_enabled() { return !g_dev.empty() && g_on_host; }
 
 void cvec_apply(float* R, int64_t layer, int64_t T, int64_t r_ld, const float* bo, int64_t bo_ld, const float* inj,
                 int64_t inj_ld, bool write, void* stream) {
     if (!g_cvec.loaded() || T < 1) return;
+    const DevTables* t = tables_here();
+    if (t == nullptr) throw std::runtime_error("cvec_apply: the control vector was not uploaded to this GPU");
     const dim3 grid((unsigned) g_cvec.hc, (unsigned) T);
-    cvec_kernel<<<grid, THREADS, 0, (cudaStream_t) stream>>>(R, g_cvec.dir, g_cvec.s, g_cvec.on, g_cvec.mode, layer,
+    cvec_kernel<<<grid, THREADS, 0, (cudaStream_t) stream>>>(R, t->dir, t->s, t->on, g_cvec.mode, layer,
                                                             (int) g_cvec.n_embd, (int) g_cvec.hc, r_ld, bo, bo_ld,
                                                             inj, inj_ld, write ? 1 : 0);
     if (cudaPeekAtLastError() != cudaSuccess) throw std::runtime_error("cvec_apply: launch failed");

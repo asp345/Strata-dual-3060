@@ -106,21 +106,24 @@ struct LoadReport {
 
 class WeightTable {
 public:
-    /// The arena size the index asks for, readable WITHOUT loading anything - so a caller can size its
-    /// `DeviceArena` before committing to the load, and a plan that cannot fit is refused at startup rather
-    /// than halfway through a 5 GB upload.
-    /// With `skip`, the size of the compacted arena that holds every tensor EXCEPT the named ones.
-    static bool pool_bytes(const std::string& pack_dir, uint64_t& out, std::string& err,
+    /// The arena sizes the index asks for, one per pipeline stage (`placement()`), readable WITHOUT loading
+    /// anything - so a caller can size its arenas before committing to the load, and a plan that cannot fit is
+    /// refused at startup rather than halfway through a 5 GB upload.
+    /// With `skip`, the sizes of the compacted arenas that hold every tensor EXCEPT the named ones.
+    static bool pool_bytes(const std::string& pack_dir, std::vector<uint64_t>& out, std::string& err,
                            const std::set<std::string>* skip = nullptr);
+    /// Every tensor's engine-form bytes in an arena (at the index's alignment), by name.
+    static bool tensor_bytes(const std::string& pack_dir, std::map<std::string, uint64_t>& out, std::string& err);
 
-    /// Load every tensor in `<pack_dir>/index.txt` into `arena_base`.
+    /// Load every tensor in `<pack_dir>/index.txt` into the arena of its pipeline stage (`arenas[s]` is device
+    /// memory on stage s's GPU).
     ///
-    /// `arena_bytes` MUST be at least `pool_bytes`; the loader checks rather than trusting the caller,
+    /// `arena_bytes[s]` MUST be at least `pool_bytes`' entry; the loader checks rather than trusting the caller,
     /// because the failure mode otherwise is a device write past the end of the arena.
     /// With `skip`, the named tensors are not read: their rows keep their metadata with `data == nullptr` and
-    /// `resident == false`, and the other tensors are packed into the compacted arena `pool_bytes` sized.
-    bool load(const std::string& pack_dir, void* arena_base, uint64_t arena_bytes, std::string& err,
-              const std::set<std::string>* skip = nullptr);
+    /// `resident == false`, and the other tensors are packed into the compacted arenas `pool_bytes` sized.
+    bool load(const std::string& pack_dir, const std::vector<void*>& arenas, const std::vector<uint64_t>& arena_bytes,
+              std::string& err, const std::set<std::string>* skip = nullptr);
 
     const WeightRef* find(const std::string& name) const;
     const std::map<std::string, WeightRef>& all() const { return table_; }

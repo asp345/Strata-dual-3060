@@ -1,5 +1,6 @@
 // src/core/mtp.cpp - see include/strata/core/mtp.hpp.
 #include "strata/core/mtp.hpp"
+#include "strata/core/placement.hpp"
 
 #include "strata/core/native_head.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
@@ -80,6 +81,7 @@ bool read_file(const std::string& path, std::vector<uint8_t>& out) {
 }  // namespace
 
 MtpDrafter::~MtpDrafter() {
+    DeviceGuard dg(device_);
     if (cs_) cudaStreamSynchronize(cs_);
     for (auto& e : prefill_exec_) if (e) cudaGraphExecDestroy(e);
     for (auto& e : round_exec_) if (e) cudaGraphExecDestroy(e);
@@ -115,6 +117,8 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     ss_ = &ss;
     max_t_ = max_t;
     rt_dir_ = rt_dir;
+    device_ = placement().device(placement().last());   // beside the head and the verify window's final residual
+    DeviceGuard dg(device_);
     if (max_t < 1 || max_t > strata::kernels::kVerifyMaxT) { err = "mtp: max_t out of range"; return false; }
     // ---- the index and the dense weights
     {
@@ -158,22 +162,26 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     // ---- the layer's own K/V (dense attention: no indexer state is read)
     const strata::kernels::QsaShapes s = shapes_of(g);
     const int64_t max_cells = ss.qsa_states[0].max_cells;
+    // the RoPE table of a QSA layer on this GPU, or one of its own when its stage has none
+    const QsaState* rope = nullptr;
+    for (int64_t i = 0; i < g.n_qsa_layers() && rope == nullptr; ++i)
+        if (placement().stage_of(qsa_layer_of(g, i)) == placement().last()) rope = &ss.qsa_states[i];
     // KV streaming: the drafter only reads its last `window` cells, so with streaming on its K/V is a ring of the
     // window (plus the cells a round writes ahead of its queries) over a host copy, refilled on a resume. The host copy
     // is pinned after the expert arena has pinned what it could: if it does not fit, the K/V stays whole in VRAM.
     int64_t ring = (window > 0 && window < max_cells) ? window + 4 * (int64_t) max_t + 64 : 0;
-    uint64_t sb = qsa_state_bytes(g, max_cells, false, ring);
+    uint64_t sb = qsa_state_bytes(g, max_cells, rope == nullptr, ring);
     if (cudaMalloc(&state_arena_, sb) != cudaSuccess) { err = "mtp: the K/V state does not fit"; return false; }
-    if (qsa_state_init(g, max_cells, state_arena_, st_, &ss.qsa_states[0], ring) == 0) {
+    if (qsa_state_init(g, max_cells, state_arena_, st_, rope, ring) == 0) {
         if (st_.kv_mode == 0) { err = "mtp: state init failed"; return false; }
         std::fprintf(stderr, "strata mtp: no pinned RAM left for the draft layer's K/V copy; keeping it in VRAM\n");
         cudaGetLastError();
         cudaFree(state_arena_);
         st_ = QsaState{};
         ring = -1;   // fully resident
-        sb = qsa_state_bytes(g, max_cells, false, ring);
+        sb = qsa_state_bytes(g, max_cells, rope == nullptr, ring);
         if (cudaMalloc(&state_arena_, sb) != cudaSuccess) { err = "mtp: the K/V state does not fit"; return false; }
-        if (qsa_state_init(g, max_cells, state_arena_, st_, &ss.qsa_states[0], ring) == 0) { err = "mtp: state init failed"; return false; }
+        if (qsa_state_init(g, max_cells, state_arena_, st_, rope, ring) == 0) { err = "mtp: state init failed"; return false; }
     }
     qsa_state_zero(st_, g, nullptr);
     cudaDeviceSynchronize();
@@ -243,6 +251,7 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
 }
 
 bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float* window_R, std::string& err) {
+    DeviceGuard dg(device_);
     wt_ = &wt;
     head_ = head;
     window_R_ = window_R;
@@ -418,7 +427,7 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
         for (int t = 0; t < T; ++t)
             gr_read(R_ + (size_t) t * HC * N, f32("hyper_connection_mixer.hc_norm.weight"),
                     bf16("hyper_connection_mixer.input_mix_weight_down.weight"),
-                    bf16("hyper_connection_mixer.input_mix_weight_up.weight"), nullptr, EPS, gs, ss.block.gr,
+                    bf16("hyper_connection_mixer.input_mix_weight_up.weight"), nullptr, EPS, gs, ss.stages.back().block.gr,
                     sample_ + t * N, dummy_inj_, cs);
         native_quantize_q8_1(sample_, xq_, (int) N, T, cs);
         const bool sub = dhead_ != nullptr;
@@ -512,6 +521,7 @@ bool MtpDrafter::capture_step(int j, std::string& err) {
 
 void MtpDrafter::kv_restore(int64_t upto) {
     if (st_.kv_mode != 2 || upto <= 0) return;
+    DeviceGuard dg(device_);
     // the ring's blocks below `upto`, from the host copy: a checkpoint resume may have left later cells in them
     const strata::kernels::QsaShapes s = shapes_of(*g_);
     const int64_t b1 = (upto + s.page_size - 1) / s.page_size, b0 = std::max<int64_t>(0, b1 - st_.n_slots);
@@ -520,6 +530,7 @@ void MtpDrafter::kv_restore(int64_t upto) {
 }
 
 bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err) {
+    DeviceGuard dg(device_);
     const Clock::time_point t0 = Clock::now();
     const int64_t HCN = g_->hc * g_->n_embd;
     // cells the window can never reach again need no K/V
@@ -552,6 +563,7 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
 bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
                        float* probs, float min_p, int* n_drafts) {
     if (T < 1 || T > max_t_ || a < 0 || a >= T) { err = "mtp: draft arguments out of range"; return false; }
+    DeviceGuard dg(device_);
     if (!capture_round(T, err)) return false;
     const Clock::time_point t0 = Clock::now();
     const int64_t NH = g_->n_head;
@@ -602,6 +614,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
 bool MtpDrafter::draft_first(int T, const float* R_row, int32_t token, int64_t cell, int32_t* drafts, std::string& err,
                              float* probs, float min_p, int* n_drafts) {
     // row 0 is the real pair; rows 1.. repeat it and only write cells the next round overwrites
+    DeviceGuard dg(device_);
     const int64_t HCN = g_->hc * g_->n_embd;
     for (int t = 0; t < T; ++t)
         if (cudaMemcpy((void*) (window_R_ + (size_t) t * HCN), R_row, (size_t) HCN * sizeof(float),

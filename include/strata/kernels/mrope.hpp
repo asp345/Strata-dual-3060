@@ -18,6 +18,7 @@
 
 namespace strata::kernels {
 
+/// The table of the CURRENT GPU: each GPU of a pipeline holds its own copy and a kernel reads its GPU's.
 void mrope_table_set(const int32_t* device_table);
 const int32_t* mrope_table();
 

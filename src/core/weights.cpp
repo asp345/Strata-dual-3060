@@ -1,6 +1,8 @@
 // src/core/weights.cpp - the dense-weight loader.  See the header for the engine-vs-pack distinction.
 #include "strata/core/weights.hpp"
 
+#include "strata/core/placement.hpp"
+
 #include "strata/kernels/f16_bits.hpp"
 
 #include <cuda_runtime.h>
@@ -86,14 +88,13 @@ bool read_at(std::FILE* f, uint64_t off, void* dst, size_t n, std::string& err, 
 
 }  // namespace
 
-bool WeightTable::pool_bytes(const std::string& pack_dir, uint64_t& out, std::string& err,
-                             const std::set<std::string>* skip) {
+bool WeightTable::tensor_bytes(const std::string& pack_dir, std::map<std::string, uint64_t>& out, std::string& err) {
     const std::string path = pack_dir + "/index.txt";
     std::FILE* f = std::fopen(path.c_str(), "rb");
     if (!f) { err = "cannot open " + path; return false; }
     char line[1024];
-    out = 0;
-    uint64_t pool = 0, compact = 0;
+    std::vector<std::pair<std::string, uint64_t>> rows;
+    uint64_t pool = 0;
     int align = 0;
     while (std::fgets(line, sizeof line, f)) {
         if (line[0] == '#') {
@@ -102,24 +103,34 @@ bool WeightTable::pool_bytes(const std::string& pack_dir, uint64_t& out, std::st
             if (std::sscanf(line, "# align %d pool %llu tensors %d", &a, &p, &tensors) == 3) { pool = p; align = a; }
             continue;
         }
-        if (skip == nullptr) continue;
         char name[256] = {0};
         unsigned long long dst_bytes = 0, dummy = 0;
         int i1 = 0, i2 = 0;
         if (std::sscanf(line, "%255s %d %d %llu %llu %llu %llu", name, &i1, &i2, &dummy, &dummy, &dummy, &dst_bytes) != 7)
             continue;
-        if (skip->count(name)) continue;
-        const uint64_t a = align > 0 ? (uint64_t) align : 256;
-        compact += (dst_bytes + a - 1) / a * a;
+        rows.emplace_back(name, dst_bytes);
     }
     std::fclose(f);
     if (pool == 0) { err = "no '# align ... pool ...' header in " + path; return false; }
-    out = skip ? compact : pool;
+    const uint64_t a = align > 0 ? (uint64_t) align : 256;
+    out.clear();
+    for (const auto& [name, bytes] : rows) out[name] = (bytes + a - 1) / a * a;
     return true;
 }
 
-bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t arena_bytes, std::string& err,
-                       const std::set<std::string>* skip) {
+bool WeightTable::pool_bytes(const std::string& pack_dir, std::vector<uint64_t>& out, std::string& err,
+                             const std::set<std::string>* skip) {
+    std::map<std::string, uint64_t> bytes;
+    if (!tensor_bytes(pack_dir, bytes, err)) return false;
+    const Placement& pl = placement();
+    out.assign((size_t) pl.stages(), 0);
+    for (const auto& [name, b] : bytes)
+        if (skip == nullptr || !skip->count(name)) out[(size_t) pl.stage_of_tensor(name)] += b;
+    return true;
+}
+
+bool WeightTable::load(const std::string& pack_dir, const std::vector<void*>& arenas,
+                       const std::vector<uint64_t>& arena_bytes, std::string& err, const std::set<std::string>* skip) {
     const std::string path = pack_dir + "/index.txt";
     std::FILE* idx = std::fopen(path.c_str(), "rb");
     if (!idx) { err = "cannot open " + path + " (run tools/pack_index.py)"; return false; }
@@ -167,21 +178,31 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
 
     if (pool == 0 || rows.empty()) { err = "index.txt has no header or no rows"; return false; }
     // Plan v0.3 P1: a skip set compacts the arena.  Kept rows are re-placed in index order at the index's
-    // alignment; skipped rows keep their metadata and get no bytes.
-    std::vector<bool> skipped(rows.size(), false);
-    if (skip != nullptr) {
-        const uint64_t a = align > 0 ? (uint64_t) align : 256;
-        uint64_t at = 0;
-        for (size_t i = 0; i < rows.size(); ++i) {
-            if (skip->count(rows[i].name)) { skipped[i] = true; continue; }
-            rows[i].dst_off = at;
-            at += (rows[i].dst_bytes + a - 1) / a * a;
-        }
-        pool = at;
-    }
-    if (arena_bytes < pool) {
-        err = "arena is " + std::to_string(arena_bytes) + " B but the index needs " + std::to_string(pool);
+    // alignment, each in the arena of its pipeline stage; skipped rows keep their metadata and get no bytes.
+    const Placement& pl = placement();
+    if (arenas.size() != (size_t) pl.stages() || arena_bytes.size() != arenas.size()) {
+        err = "the weight arenas do not match the GPU placement";
         return false;
+    }
+    std::vector<bool> skipped(rows.size(), false);
+    std::vector<int> stage(rows.size(), 0);
+    {
+        const uint64_t a = align > 0 ? (uint64_t) align : 256;
+        std::vector<uint64_t> at(arenas.size(), 0);
+        for (size_t i = 0; i < rows.size(); ++i) {
+            if (skip != nullptr && skip->count(rows[i].name)) { skipped[i] = true; continue; }
+            stage[i] = pl.stage_of_tensor(rows[i].name);
+            rows[i].dst_off = at[(size_t) stage[i]];
+            at[(size_t) stage[i]] += (rows[i].dst_bytes + a - 1) / a * a;
+        }
+        for (size_t s = 0; s < arenas.size(); ++s)
+            if (arena_bytes[s] < at[s]) {
+                err = "arena " + std::to_string(s) + " is " + std::to_string(arena_bytes[s]) + " B but the index needs " +
+                      std::to_string(at[s]);
+                return false;
+            }
+        pool = 0;
+        for (uint64_t b : at) pool += b;
     }
 
     // Two pinned staging buffers, both reused.  Pinned because a 5 GB pageable upload spends its time in the
@@ -199,15 +220,14 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
     // one of the 90 widened tensors - a heap corruption that would have been blamed on whatever ran next.
     void* stage_in = nullptr;
     void* stage_out = nullptr;
-    if (cudaHostAlloc(&stage_in, CHUNK, cudaHostAllocDefault) != cudaSuccess ||
-        cudaHostAlloc(&stage_out, CHUNK * 2, cudaHostAllocDefault) != cudaSuccess) {
+    if (cudaHostAlloc(&stage_in, CHUNK, cudaHostAllocPortable) != cudaSuccess ||
+        cudaHostAlloc(&stage_out, CHUNK * 2, cudaHostAllocPortable) != cudaSuccess) {
         err = "cudaHostAlloc for the staging buffers failed";
         if (stage_in) cudaFreeHost(stage_in);
         if (stage_out) cudaFreeHost(stage_out);
         return false;
     }
 
-    uint8_t* dst_base = (uint8_t*) arena_base;
     std::FILE* cur = nullptr;
     int cur_file = -1;
     table_.clear();
@@ -217,6 +237,7 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
     double upload_ms = 0;
     for (size_t row_i = 0; row_i < rows.size(); ++row_i) {
         const IndexRow& r = rows[row_i];
+        uint8_t* dst_base = (uint8_t*) arenas[(size_t) stage[row_i]];
         if (skipped[row_i]) {
             WeightRef wr;
             wr.data = nullptr;
@@ -444,7 +465,10 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
     report_.arena_bytes = pool;
     report_.read_ms = now_ms() - t_read0 - upload_ms;
     report_.upload_ms = upload_ms;
-    if (cudaDeviceSynchronize() != cudaSuccess) { err = "cudaDeviceSynchronize after the load failed"; return false; }
+    for (int s = 0; s < pl.stages(); ++s) {
+        DeviceGuard dg(pl.device(s));
+        if (cudaDeviceSynchronize() != cudaSuccess) { err = "cudaDeviceSynchronize after the load failed"; return false; }
+    }
     return true;
 }
 

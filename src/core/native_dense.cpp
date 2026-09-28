@@ -1,4 +1,5 @@
 #include "strata/core/native_dense.hpp"
+#include "strata/core/placement.hpp"
 #include "strata/core/weights.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/kernels/native_mmvq.hpp"
@@ -35,15 +36,16 @@ struct Pending {
 };
 }
 
-bool NativeDense::served_names(const std::vector<std::string>& shards, bool include_ple_key,
-                               std::set<std::string>& out, std::string& err) {
+bool NativeDense::served_bytes(const std::vector<std::string>& shards, bool include_ple_key,
+                               std::map<std::string, uint64_t>& out, std::string& err) {
     try {
         for (const auto& path : shards) {
             strata::GgufFile gguf(path);
             for (const auto& tensor : gguf.tensors())
                 if (eligible(tensor, include_ple_key) && strata::kernels::native_mmvq_supported(tensor.type) &&
                     tensor.shape.size() == 2)
-                    out.insert(tensor.name);
+                    out[tensor.name] = strata::kernels::native_mmvq_weight_bytes(tensor.type, (int) tensor.shape[0],
+                                                                                  (int) tensor.shape[1]);
         }
         return true;
     } catch (const std::exception& error) {
@@ -53,18 +55,20 @@ bool NativeDense::served_names(const std::vector<std::string>& shards, bool incl
 }
 
 NativeDense::~NativeDense() {
-    if (scratch_) cudaFree(scratch_);
+    for (void* p : scratch_) cudaFree(p);
     for (void* p : weights_) cudaFree(p);
 }
 
 bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& table, std::string& err,
                        bool include_ple_key) {
-    if (scratch_ || !weights_.empty()) { err = "native dense: already loaded"; return false; }
+    if (!scratch_.empty() || !weights_.empty()) { err = "native dense: already loaded"; return false; }
     if (shards.empty()) { err = "native dense: at least one GGUF shard is required"; return false; }
     try {
         std::vector<Pending> pending;
+        std::vector<int> pending_stage;
         std::set<std::string> seen;
-        int max_in = 0;
+        const Placement& pl = placement();
+        std::vector<int> max_in((size_t) pl.stages(), 0);
         uint64_t total = 0;
         uint64_t split_count = 0, split_tensors = 0;
         std::set<uint64_t> split_numbers;
@@ -145,6 +149,8 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 }
                 const auto bytes = strata::kernels::native_mmvq_weight_bytes(
                     tensor.type, (int) ref.ne0, (int) ref.ne1);
+                const int stage = pl.stage_of_tensor(tensor.name);
+                DeviceGuard dg(pl.device(stage));
                 void* allocation = nullptr;
                 auto status = cudaMalloc(&allocation, bytes);
                 DevicePtr data(allocation);
@@ -153,25 +159,31 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 if (status != cudaSuccess) {
                     err = "native dense upload " + tensor.name + ": " + cudaGetErrorString(status); return false;
                 }
-                max_in = (std::max)(max_in, (int) ref.ne0);
+                max_in[(size_t) stage] = (std::max)(max_in[(size_t) stage], (int) ref.ne0);
                 total += bytes;
                 pending.push_back(Pending{&ref, (int) tensor.type, bytes, std::move(data)});
+                pending_stage.push_back(stage);
             }
         }
         if (pending.empty()) { err = "native dense: no supported GDN/QSA matrices in supplied shards"; return false; }
-        void* allocation = nullptr;
-        const auto status = cudaMalloc(&allocation, strata::kernels::native_q8_1_bytes(max_in));
-        DevicePtr scratch(allocation);
-        if (status != cudaSuccess) { err = std::string("native dense scratch: ") + cudaGetErrorString(status); return false; }
-        // All checks and allocations finish before publishing any reference.
+        std::vector<DevicePtr> scratch;
+        for (int s = 0; s < pl.stages(); ++s) {
+            DeviceGuard dg(pl.device(s));
+            void* allocation = nullptr;
+            const auto status = max_in[(size_t) s] > 0
+                ? cudaMalloc(&allocation, strata::kernels::native_q8_1_bytes(max_in[(size_t) s])) : cudaSuccess;
+            scratch.emplace_back(allocation);
+            if (status != cudaSuccess) { err = std::string("native dense scratch: ") + cudaGetErrorString(status); return false; }
+        }
         weights_.reserve(pending.size());
-        for (auto& item : pending) {
+        for (size_t i = 0; i < pending.size(); ++i) {
+            Pending& item = pending[i];
             item.ref->native_data = item.data.get();
             item.ref->native_type = item.type;
-            item.ref->native_q8_1 = scratch.get();
+            item.ref->native_q8_1 = scratch[(size_t) pending_stage[i]].get();
             weights_.push_back(item.data.release());
         }
-        scratch_ = scratch.release();
+        for (DevicePtr& p : scratch) scratch_.push_back(p.release());
         bytes_ = total;
         return true;
     } catch (const std::exception& error) {

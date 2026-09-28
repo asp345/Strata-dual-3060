@@ -1,5 +1,6 @@
 // src/core/session.cpp - one token through all 48 layers.  See the header for why the graphs are per-layer.
 #include "strata/core/session.hpp"
+#include "strata/core/placement.hpp"
 #include "strata/core/progress.hpp"
 
 #include "strata/kernels/qsa.hpp"
@@ -34,14 +35,6 @@ constexpr uint64_t SESSION_STATE_ALIGN = 256;
 
 uint64_t align_up(uint64_t n, uint64_t a) { return (n + a - 1) / a * a; }
 
-/// The floats one GDN layer's recurrent + conv state needs.  `gdn_buffers_bytes` carves them for ONE layer and
-/// `GdnBuffers::state`/`conv_state` point INTO that carve, so a session with 36 GDN layers has to give each one
-/// its own - they cannot share, because the recurrence is the whole point.
-uint64_t gdn_state_floats(const ModelGeometry& g) {
-    return (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
-           (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
-}
-
 }  // namespace
 
 /// `NG_HIST` rows of `hc_dim` floats: the PLE conv's history, which is the ONLY PLE state that lives in the
@@ -50,87 +43,143 @@ static uint64_t ple_hist_bytes() {
     return (uint64_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM * sizeof(float);
 }
 
-uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k) {
+/// The floats one GDN layer's recurrent + conv state needs.  `gdn_buffers_bytes` carves them for ONE layer and
+/// `GdnBuffers::state`/`conv_state` point INTO that carve, so a session with 36 GDN layers has to give each one
+/// its own - they cannot share, because the recurrence is the whole point.
+uint64_t gdn_state_floats(const ModelGeometry& g) {
+    return (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
+           (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
+}
+
+int64_t gdn_layer_of(const ModelGeometry& g, int64_t gdn_index) {
+    const int64_t per = g.qsa_interval - 1;
+    return gdn_index / per * g.qsa_interval + gdn_index % per;
+}
+
+int64_t qsa_layer_of(const ModelGeometry& g, int64_t qsa_index) { return qsa_index * g.qsa_interval + g.qsa_interval - 1; }
+
+namespace {
+/// Stage `stage`'s layers, counted: its GDN and QSA layers, and whether it holds layer 1 (the PLE).
+struct StageLayers { int64_t gdn = 0, qsa = 0; bool ple = false; };
+StageLayers stage_layers(const ModelGeometry& g, int stage) {
+    const Placement& pl = placement();
+    StageLayers c;
+    for (int64_t l = pl.first(stage); l < pl.end(stage); ++l) {
+        if (is_qsa_layer(g, l)) ++c.qsa;
+        else ++c.gdn;
+    }
+    c.ple = pl.stage_of(1) == stage;
+    return c;
+}
+}  // namespace
+
+uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int stage) {
+    const StageLayers c = stage_layers(g, stage);
     uint64_t n = 0;
     n += gdn_buffers_bytes(g);
-    n += (uint64_t) g.n_gdn_layers() * gdn_state_floats(g) * 4;
-    // One QSA state carries the RoPE table; the others borrow it (P7: 64 MiB per layer at 262K).
-    if (g.n_qsa_layers() > 0)
-        n += qsa_state_bytes(g, max_cells, true) + (uint64_t) (g.n_qsa_layers() - 1) * qsa_state_bytes(g, max_cells, false);
+    n += (uint64_t) c.gdn * gdn_state_floats(g) * 4;
+    // One QSA state per stage carries the RoPE table; the stage's others borrow it (P7: 64 MiB per layer at 262K).
+    if (c.qsa > 0)
+        n += qsa_state_bytes(g, max_cells, true) + (uint64_t) (c.qsa - 1) * qsa_state_bytes(g, max_cells, false);
     n += qsa_buffers_bytes(g, max_cells);
     n += moe_buffers_bytes(g, k);
     n += block_buffers_bytes(g);
-    n += ple_hist_bytes();                       // the PLE's NG_HIST normalized history rows
-    return align_up(n, SESSION_STATE_ALIGN) + 4096;
+    if (c.ple) n += ple_hist_bytes();            // the PLE's NG_HIST normalized history rows
+    return align_up(n, SESSION_STATE_ALIGN) + 4096 + (uint64_t) (c.gdn + c.qsa + 8) * SESSION_STATE_ALIGN;
 }
 
-uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void* base, SessionState& s) {
-    uint8_t* p = (uint8_t*) base;
-    uint64_t used = 0;
-    auto take = [&](uint64_t bytes) {
-        uint8_t* r = p + used;
-        used = align_up(used + bytes, SESSION_STATE_ALIGN);
-        return r;
-    };
-
+bool session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, const std::vector<void*>& bases,
+                  SessionState& s) {
+    const Placement& pl = placement();
+    if (bases.size() != (size_t) pl.stages()) return false;
     s.max_cells = max_cells;
     s.k = k;
-
-    gdn_buffers_init(g, take(gdn_buffers_bytes(g)), s.gdn);
-    s.gdn_state = (float*) take((uint64_t) g.n_gdn_layers() * gdn_state_floats(g) * 4);
-
-    // the 12 QSA states are separate allocations carved from one arena, because `QsaState` is a struct of
-    // pointers and `qsa_state_init` writes them - a contiguous array would need the arena to be laid out the
-    // same way, which is a coupling with nothing to gain.
-    const uint64_t first = qsa_state_bytes(g, max_cells, true), rest = qsa_state_bytes(g, max_cells, false);
-    s.qsa_state_arena = take(g.n_qsa_layers() > 0 ? first + (uint64_t) (g.n_qsa_layers() - 1) * rest : 0);
+    s.stages.assign(bases.size(), SessionStage{});
+    s.gdn_states.assign((size_t) g.n_gdn_layers(), nullptr);
     s.qsa_states = new QsaState[(size_t) g.n_qsa_layers()];
-    s.qsa_buf_arena = take(qsa_buffers_bytes(g, max_cells));
-
-    uint8_t* qp = (uint8_t*) s.qsa_state_arena;
-    // a layer whose pinned RAM could not be had (KV streaming's host copy) is half-built: going on would have the
-    // attention read null host pointers at the first request ("illegal memory access"), so the session fails here
-    for (int64_t i = 0; i < g.n_qsa_layers(); ++i)
-        if (qsa_state_init(g, max_cells, qp + (i == 0 ? 0 : first + (uint64_t) (i - 1) * rest), s.qsa_states[i],
-                           i == 0 ? nullptr : &s.qsa_states[0]) == 0)
-            return 0;
-    qsa_buffers_init(g, max_cells, s.qsa_buf_arena, s.qsa_bufs);
-
-    s.moe_arena = take(moe_buffers_bytes(g, k));
-    moe_buffers_init(g, k, s.moe_arena, s.moe);
-    s.block_arena = take(block_buffers_bytes(g));
-    block_buffers_init(g, s.block_arena, s.block);
-    // THE PLE HISTORY: NG_HIST rows of hc_dim floats, row-fastest.  Sequence state, carved here and zeroed by
-    // `session_zero`; it survives every token, which is the whole point of a conv history.
-    s.ple_hist = (float*) take(ple_hist_bytes());
-    s.R = s.block.R;
-    return used;
+    int64_t gdn_index = 0, qsa_index = 0;
+    for (int st = 0; st < pl.stages(); ++st) {
+        DeviceGuard dg(pl.device(st));
+        SessionStage& ps = s.stages[(size_t) st];
+        ps.device = pl.device(st);
+        if (cudaStreamCreateWithFlags(&ps.cs, cudaStreamNonBlocking) != cudaSuccess) return false;
+        uint8_t* p = (uint8_t*) bases[(size_t) st];
+        uint64_t used = 0;
+        auto take = [&](uint64_t bytes) {
+            uint8_t* r = p + used;
+            used = align_up(used + bytes, SESSION_STATE_ALIGN);
+            return r;
+        };
+        gdn_buffers_init(g, take(gdn_buffers_bytes(g)), ps.gdn);
+        // the QSA states are separate allocations carved from the stage's arena, because `QsaState` is a struct
+        // of pointers and `qsa_state_init` writes them
+        const QsaState* rope = nullptr;
+        for (int64_t l = pl.first(st); l < pl.end(st); ++l) {
+            if (!is_qsa_layer(g, l)) {
+                s.gdn_states[(size_t) gdn_index++] = (float*) take(gdn_state_floats(g) * 4);
+                continue;
+            }
+            QsaState& q = s.qsa_states[qsa_index++];
+            // a layer whose pinned RAM could not be had (KV streaming's host copy) is half-built: going on would
+            // have the attention read null host pointers at the first request ("illegal memory access"), so the
+            // session fails here
+            if (qsa_state_init(g, max_cells, take(qsa_state_bytes(g, max_cells, rope == nullptr)), q, rope) == 0)
+                return false;
+            if (rope == nullptr) rope = &q;
+        }
+        qsa_buffers_init(g, max_cells, take(qsa_buffers_bytes(g, max_cells)), ps.qsa_bufs);
+        moe_buffers_init(g, k, take(moe_buffers_bytes(g, k)), ps.moe);
+        block_buffers_init(g, take(block_buffers_bytes(g)), ps.block);
+        // THE PLE HISTORY: NG_HIST rows of hc_dim floats, row-fastest.  Sequence state, carved here and zeroed by
+        // `session_zero`; it survives every token, which is the whole point of a conv history.
+        if (pl.stage_of(1) == st) s.ple_hist = (float*) take(ple_hist_bytes());
+        if (used > session_bytes(g, max_cells, k, st)) return false;
+    }
+    return true;
 }
 
 void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, void* stream) {
-    cudaStream_t cs = (cudaStream_t) stream;
-    // the residual: `hc` copies of the one vector a caller hands in.  A real sequence's first token is the
-    // embedding broadcast to every stream, which is the reference's own initial condition.
-    if (R_init != nullptr) {
-        for (int64_t c = 0; c < g.hc; ++c)
-            cudaMemcpyAsync(s.block.R + (size_t) c * g.n_embd, R_init, (size_t) g.n_embd * 4,
-                            cudaMemcpyDeviceToDevice, cs);
-    } else {
-        cudaMemsetAsync(s.block.R, 0, (size_t) g.hc * g.n_embd * 4, cs);
+    const Placement& pl = placement();
+    for (int st = 0; st < (int) s.stages.size(); ++st) {
+        DeviceGuard dg(pl.device(st));
+        SessionStage& ps = s.stages[(size_t) st];
+        const cudaStream_t cs = st == 0 ? (cudaStream_t) stream : ps.cs;
+        // the residual: `hc` copies of the one vector a caller hands in.  A real sequence's first token is the
+        // embedding broadcast to every stream, which is the reference's own initial condition.
+        if (R_init != nullptr && st == 0) {
+            for (int64_t c = 0; c < g.hc; ++c)
+                cudaMemcpyAsync(ps.block.R + (size_t) c * g.n_embd, R_init, (size_t) g.n_embd * 4,
+                                cudaMemcpyDeviceToDevice, cs);
+        } else {
+            cudaMemsetAsync(ps.block.R, 0, (size_t) g.hc * g.n_embd * 4, cs);
+        }
+        // every GDN layer's recurrence and conv history, and every QSA layer's cache and indexer
+        for (int64_t l = pl.first(st); l < pl.end(st); ++l) {
+            if (!is_qsa_layer(g, l)) continue;
+            qsa_state_zero(s.qsa_states[l / g.qsa_interval], g, (void*) cs);
+        }
+        for (int64_t i = 0; i < g.n_gdn_layers(); ++i)
+            if (pl.stage_of(gdn_layer_of(g, i)) == st)
+                cudaMemsetAsync(s.gdn_states[(size_t) i], 0, (size_t) gdn_state_floats(g) * 4, cs);
+        // **AND THE PLE'S CONV HISTORY AND TOKEN WINDOW.**  A sequence that started with a warm history would
+        // convolve over rows belonging to a different sequence - the conv reads NG_HIST previous NORMALIZED rows,
+        // so a stale one is a real contribution and not a zero.  The token window resets to `NG_HIST`-many nulls
+        // for the same reason: `ngram_rows` treats a missing predecessor as the EOS cut, which is what a sequence
+        // boundary IS.
+        if (pl.stage_of(1) == st) cudaMemsetAsync(s.ple_hist, 0, (size_t) ple_hist_bytes(), cs);
+        if (st > 0) cudaStreamSynchronize(cs);
     }
-    // every GDN layer's recurrence and conv history
-    cudaMemsetAsync(s.gdn_state, 0, (size_t) g.n_gdn_layers() * gdn_state_floats(g) * 4, cs);
-    // and every QSA layer's cache and indexer
-    for (int64_t i = 0; i < g.n_qsa_layers(); ++i) qsa_state_zero(s.qsa_states[i], g, stream);
-    // **AND THE PLE'S CONV HISTORY AND TOKEN WINDOW.**  A sequence that started with a warm history would
-    // convolve over rows belonging to a different sequence - the conv reads NG_HIST previous NORMALIZED rows,
-    // so a stale one is a real contribution and not a zero.  The token window resets to `NG_HIST`-many nulls
-    // for the same reason: `ngram_rows` treats a missing predecessor as the EOS cut, which is what a sequence
-    // boundary IS.
-    cudaMemsetAsync(s.ple_hist, 0, (size_t) ple_hist_bytes(), cs);
     s.ple_prev[0] = -1;
     s.ple_prev[1] = -1;
     s.ple_token = -1;
+}
+
+bool session_sync(const SessionState& s) {
+    for (const SessionStage& ps : s.stages) {
+        DeviceGuard dg(ps.device);
+        if (cudaDeviceSynchronize() != cudaSuccess) return false;
+    }
+    return true;
 }
 
 /// Sets `s.gdn.state`/`conv_state` for `layer`, which is what makes one layer's GDN state its own.  Shared by
@@ -139,8 +188,9 @@ void gdn_point_at(const ModelGeometry& g, int64_t layer, SessionState& s) {
     if (is_qsa_layer(g, layer)) return;
     int64_t gdn_index = 0;
     for (int64_t l = 0; l < layer; ++l) if (!is_qsa_layer(g, l)) ++gdn_index;
-    s.gdn.state = s.gdn_state + (size_t) gdn_index * gdn_state_floats(g);
-    s.gdn.conv_state = s.gdn.state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
+    GdnBuffers& gb = s.stages[(size_t) placement().stage_of(layer)].gdn;
+    gb.state = s.gdn_states[(size_t) gdn_index];
+    gb.conv_state = gb.state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
 }
 
 /// The per-token staging every QSA layer's captured H2D reads FROM.  Must run before each replay: the graphs
@@ -202,9 +252,9 @@ bool session_capture(const WeightTable& tables, const ModelGeometry& g, SessionS
             // R0.9: `half` is 0 for every mode except the split capture, where it selects a prefix of the
             // stages so the mixer and the FFN-front-plus-router can be timed separately.
             const bool ok = post
-                                ? block_layer_post(tables, g, l, s.k, s.moe, s.block, parts, (void*) cs, err)
-                                : block_layer_pre(tables, g, l, 0, 0, s.gdn, qst, s.qsa_bufs, s.moe, s.k,
-                                                  s.block, (void*) cs, err, s.db, s.ple.ready() ? &s.ple : nullptr,
+                                ? block_layer_post(tables, g, l, s.k, s.stages[0].moe, s.stages[0].block, parts, (void*) cs, err)
+                                : block_layer_pre(tables, g, l, 0, 0, s.stages[0].gdn, qst, s.stages[0].qsa_bufs, s.stages[0].moe, s.k,
+                                                  s.stages[0].block, (void*) cs, err, s.db, s.ple.ready() ? &s.ple : nullptr,
                                                   half, stage_prefix);
             if (!ok) {
                 err = "session_capture: " + std::string(what) + " layer " + std::to_string(l) + ": " + err;
@@ -417,9 +467,9 @@ bool session_replay_stage_prefixes(const ModelGeometry& g, int64_t pos, int32_t 
     mixer_per_layer.assign((size_t) n, 0.0);
     for (int64_t l = 0; l < n; ++l) {
         // The residual as this layer receives it, before any prefix has advanced it.
-        cudaMemcpyAsync(saved, s.block.R, r_floats * sizeof(float), cudaMemcpyDeviceToDevice, cs);
+        cudaMemcpyAsync(saved, s.stages[0].block.R, r_floats * sizeof(float), cudaMemcpyDeviceToDevice, cs);
         for (int k = 1; k <= 5; ++k) {
-            if (k > 1) cudaMemcpyAsync(s.block.R, saved, r_floats * sizeof(float), cudaMemcpyDeviceToDevice, cs);
+            if (k > 1) cudaMemcpyAsync(s.stages[0].block.R, saved, r_floats * sizeof(float), cudaMemcpyDeviceToDevice, cs);
             cudaEventRecord(ev[(size_t) (l * 6 + k - 1)], cs);
             const cudaGraphExec_t ge = (k == 5) ? gr.execs[l] : gr.preP[k - 1][l];
             const cudaError_t e = cudaGraphLaunch(ge, cs);
@@ -611,7 +661,7 @@ bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, Session
     // "the input to layer 0 is already wrong" from "layer 0 is wrong".
     if (dump_layers != nullptr) {
         const size_t n = (size_t) g.hc * (size_t) g.n_embd;
-        const cudaError_t de = cudaMemcpyAsync(dump_layers, s.R, n * sizeof(float), cudaMemcpyDeviceToHost, cs);
+        const cudaError_t de = cudaMemcpyAsync(dump_layers, s.stages[0].block.R, n * sizeof(float), cudaMemcpyDeviceToHost, cs);
         if (de != cudaSuccess) {
             err = "session_loop: dump the input residual: " + std::string(cudaGetErrorString(de));
             return false;
@@ -706,7 +756,7 @@ bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, Session
         // `dump_layers` in session.hpp for why this is an enqueue and not a read.
         if (dump_layers != nullptr) {
             const size_t n = (size_t) g.hc * (size_t) g.n_embd;
-            const cudaError_t de = cudaMemcpyAsync(dump_layers + (size_t) (l + 1) * n, s.R, n * sizeof(float),
+            const cudaError_t de = cudaMemcpyAsync(dump_layers + (size_t) (l + 1) * n, s.stages[0].block.R, n * sizeof(float),
                                                    cudaMemcpyDeviceToHost, cs);
             if (de != cudaSuccess) {
                 err = "session_loop: dump layer " + std::to_string(l) + ": " + cudaGetErrorString(de);
@@ -752,24 +802,21 @@ bool session_token(const WeightTable& tables, const ModelGeometry& g, int64_t po
                    std::string& err) {
     cudaStream_t cs = (cudaStream_t) stream;
     int64_t qsa_index = 0;
-    int64_t gdn_index = 0;
 
     for (int64_t l = 0; l < g.n_layers; ++l) {
         // THE GDN LAYERS EACH GET THEIR OWN STATE, and `GdnBuffers` carries it - so the session points the
         // shared scratch at the right slice before each call.  Sharing one state across 36 layers would make
         // every layer start from the previous layer's recurrence, which produces a perfectly finite answer.
         if (!is_qsa_layer(g, l)) {
-            s.gdn.state = s.gdn_state + (size_t) gdn_index * gdn_state_floats(g);
-            s.gdn.conv_state = s.gdn.state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
-            ++gdn_index;
+            gdn_point_at(g, l, s);
         }
 
         err.clear();
         const bool ok = is_qsa_layer(g, l)
-            ? block_layer(tables, g, l, pos, pos_base, s.gdn, s.qsa_states[qsa_index], s.qsa_bufs, s.moe, s.k,
-                          s.block, parts, stream, err, nullptr, s.ple.ready() ? &s.ple : nullptr)
-            : block_layer(tables, g, l, pos, pos_base, s.gdn, s.qsa_states[0], s.qsa_bufs, s.moe, s.k,
-                          s.block, parts, stream, err, nullptr, s.ple.ready() ? &s.ple : nullptr);
+            ? block_layer(tables, g, l, pos, pos_base, s.stages[0].gdn, s.qsa_states[qsa_index], s.stages[0].qsa_bufs, s.stages[0].moe, s.k,
+                          s.stages[0].block, parts, stream, err, nullptr, s.ple.ready() ? &s.ple : nullptr)
+            : block_layer(tables, g, l, pos, pos_base, s.stages[0].gdn, s.qsa_states[0], s.stages[0].qsa_bufs, s.stages[0].moe, s.k,
+                          s.stages[0].block, parts, stream, err, nullptr, s.ple.ready() ? &s.ple : nullptr);
         if (!ok) {
             err = "layer " + std::to_string(l) + ": " + err;
             return false;
@@ -827,14 +874,14 @@ bool session_capture_token(const WeightTable& tables, const ModelGeometry& g, Se
         const bool qsa = is_qsa_layer(g, l);
         QsaState& qst = qsa ? s.qsa_states[qsa_index] : s.qsa_states[0];
         err.clear();
-        ok = block_layer_pre(tables, g, l, 0, 0, s.gdn, qst, s.qsa_bufs, s.moe, s.k, s.block, (void*) cs, err, s.db,
+        ok = block_layer_pre(tables, g, l, 0, 0, s.stages[0].gdn, qst, s.stages[0].qsa_bufs, s.stages[0].moe, s.k, s.stages[0].block, (void*) cs, err, s.db,
                              s.ple.ready() ? &s.ple : nullptr);
         if (!ok) { err = "session_capture_token: pre layer " + std::to_string(l) + ": " + err; break; }
         if (hits != nullptr) {
             // After the ring (and the shared expert): the GPU's experts run while the CPU computes the misses.
-            strata::kernels::moe_hit_select(s.moe.ids, hits->d_res + l * hits->n_expert, (int) s.k,
+            strata::kernels::moe_hit_select(s.stages[0].moe.ids, hits->d_res + l * hits->n_expert, (int) s.k,
                                             (int) hits->n_expert, hits->d_slot, hits->d_dst, hits->d_count, (void*) cs);
-            strata::kernels::quantize_q8_0_scaled(s.block.mixed, hits->x_q8, hits->x_scale, g.n_embd, (void*) cs);
+            strata::kernels::quantize_q8_0_scaled(s.stages[0].block.mixed, hits->x_q8, hits->x_scale, g.n_embd, (void*) cs);
             strata::kernels::moe_hit_grouped_s2_dev(hits->cache_base, hits->d_slot, hits->d_dst, hits->d_count, s.k,
                                                     hits->blob, hits->x_q8, hits->scratch, hits->hit_out, (void*) cs,
                                                     hits->x_scale);
@@ -844,7 +891,7 @@ bool session_capture_token(const WeightTable& tables, const ModelGeometry& g, Se
         strata::kernels::copy_from_mapped(parts_dev, y_dev, (int64_t) (parts_bytes / sizeof(float)), (void*) cs);
         if (hits != nullptr)
             strata::kernels::moe_hit_add(parts_dev, hits->hit_out, hits->d_dst, hits->d_count, s.k, g.n_embd, (void*) cs);
-        ok = block_layer_post(tables, g, l, s.k, s.moe, s.block, parts_dev, (void*) cs, err);
+        ok = block_layer_post(tables, g, l, s.k, s.stages[0].moe, s.stages[0].block, parts_dev, (void*) cs, err);
         if (!ok) { err = "session_capture_token: post layer " + std::to_string(l) + ": " + err; break; }
         if (qsa) ++qsa_index;
     }

@@ -29,6 +29,7 @@
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/shared_expert.hpp"
 #include "strata/kernels/native_moe.hpp"
+#include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/native_gdn.hpp"
 #include "strata/kernels/native_router.hpp"
 #include "strata/kernels/native_qsa.hpp"
@@ -42,6 +43,7 @@
 #include "strata/core/mtp.hpp"
 #include "strata/prefill/prefill.hpp"
 #include "strata/core/native_dense.hpp"
+#include "strata/core/placement.hpp"
 #include "strata/program/logits_selection.hpp"
 #include "strata/program/conv_cache.hpp"
 #include "strata/spec/draft_policy.hpp"
@@ -76,7 +78,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
+#include <limits>
+#include <map>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <set>
@@ -288,6 +294,11 @@ struct Options {
     int cvec_first = -1, cvec_last = -1;   ///< llama.cpp's defaults: 1 .. the last layer
     int cvec_mode = 1;                     ///< 0 = project, 1 = add (llama.cpp's default)
     int cvec_single = -1;                  ///< --cvec-dir single:L (project mode): layer L's direction everywhere
+    /// The GPUs, in pipeline order (placement.hpp): each runs a contiguous range of layers.  One GPU by default.
+    std::vector<int64_t> gpus = {0};
+    /// The first layer of every GPU after the first; empty = chosen from each GPU's free VRAM and host link
+    /// (setup_placement).
+    std::vector<int64_t> gpu_split;
 };
 
 void usage() {
@@ -405,6 +416,11 @@ void usage() {
                  "  --pool-workers N     R2.2: CPU expert pool worker count.  Default 0 = every physical core\n"
                  "                       except the one the host loop spins on.  A sweep is how the pool's\n"
                  "                       deviation from `cpu_s2` is attributed.\n"
+                 "  --gpus LIST          the GPUs (CUDA ordinals, default 0), in pipeline order: each runs a range of\n"
+                 "                       layers with its own VRAM expert slots, the last one also the head and the\n"
+                 "                       draft layer.  More than one GPU needs a native (IQ) pack\n"
+                 "  --gpu-split LIST     the first layer of every GPU after the first (default: from each GPU's free\n"
+                 "                       VRAM and host link bandwidth, measured at start)\n"
                  "  --mmap-experts       R2.1: opt OUT of the resident expert arena, back to MapViewOfFile.\n"
                  "                       The A/B arm: the mmap's rate depends on the OS page cache holding\n"
                  "                       34 GB, and measured 71.97 vs 34.78 ms/token cold vs warm.\n");
@@ -593,9 +609,14 @@ void stall_report(std::FILE* f, uint64_t layers_during) {
 void mem_mark(const char* where) {
     static const bool on = std::getenv("STRATA_TRACE") != nullptr;
     if (!on) return;
-    size_t free_b = 0, total_b = 0;
-    cudaMemGetInfo(&free_b, &total_b);
-    std::fprintf(stderr, "strata trace: %lld MiB free after %s\n", (long long) (free_b >> 20), where);
+    const strata::core::Placement& pl = strata::core::placement();
+    for (int st = 0; st < pl.stages(); ++st) {
+        strata::core::DeviceGuard dg(pl.device(st));
+        size_t free_b = 0, total_b = 0;
+        cudaMemGetInfo(&free_b, &total_b);
+        std::fprintf(stderr, "strata trace: %lld MiB free on GPU %d after %s\n", (long long) (free_b >> 20), pl.device(st),
+                     where);
+    }
 }
 
 int argmax(const std::vector<float>& v) {
@@ -650,13 +671,16 @@ ConvStateSizes conv_state_sizes(const strata::core::ModelGeometry& g) {
     return z;
 }
 
-/// Copies the running state out.  The caller has synchronized the device.
+/// Copies the running state out.  The caller has synchronized the GPUs.
 bool checkpoint_save(ConvCheckpoint& c, const strata::core::SessionState& ss, const strata::core::ModelGeometry& g) {
     const ConvStateSizes z = conv_state_sizes(g);
+    const size_t per = z.gdn / (size_t) g.n_gdn_layers();
     c.gdn.resize(z.gdn);
     c.ple.resize(ss.ple_hist != nullptr ? z.ple : 0);
     c.tails.resize(z.tail * (size_t) g.n_qsa_layers());
-    if (cudaMemcpy(c.gdn.data(), ss.gdn_state, z.gdn, cudaMemcpyDeviceToHost) != cudaSuccess) return false;
+    for (int64_t i = 0; i < g.n_gdn_layers(); ++i)
+        if (cudaMemcpy(c.gdn.data() + (size_t) i * per, ss.gdn_states[(size_t) i], per, cudaMemcpyDeviceToHost) != cudaSuccess)
+            return false;
     if (!c.ple.empty() && cudaMemcpy(c.ple.data(), ss.ple_hist, z.ple, cudaMemcpyDeviceToHost) != cudaSuccess)
         return false;
     for (int64_t i = 0; i < g.n_qsa_layers(); ++i)
@@ -670,7 +694,10 @@ bool checkpoint_save(ConvCheckpoint& c, const strata::core::SessionState& ss, co
 bool checkpoint_restore(const ConvCheckpoint& c, strata::core::SessionState& ss, const strata::core::ModelGeometry& g) {
     const ConvStateSizes z = conv_state_sizes(g);
     if (c.gdn.size() != z.gdn || c.tails.size() != z.tail * (size_t) g.n_qsa_layers()) return false;
-    if (cudaMemcpy(ss.gdn_state, c.gdn.data(), z.gdn, cudaMemcpyHostToDevice) != cudaSuccess) return false;
+    const size_t per = z.gdn / (size_t) g.n_gdn_layers();
+    for (int64_t i = 0; i < g.n_gdn_layers(); ++i)
+        if (cudaMemcpy(ss.gdn_states[(size_t) i], c.gdn.data() + (size_t) i * per, per, cudaMemcpyHostToDevice) != cudaSuccess)
+            return false;
     if (!c.ple.empty() && cudaMemcpy(ss.ple_hist, c.ple.data(), z.ple, cudaMemcpyHostToDevice) != cudaSuccess)
         return false;
     for (int64_t i = 0; i < g.n_qsa_layers(); ++i)
@@ -681,7 +708,7 @@ bool checkpoint_restore(const ConvCheckpoint& c, strata::core::SessionState& ss,
     const size_t L = c.ids.size();
     ss.ple_prev[0] = L >= 2 ? c.ids[L - 2] : -1;
     ss.ple_prev[1] = L >= 1 ? c.ids[L - 1] : -1;
-    return cudaDeviceSynchronize() == cudaSuccess;
+    return strata::core::session_sync(ss);
 }
 
 // --control-vector-scaled: llama.cpp's `common_control_vector_load` (every file's `direction.<l>` times its scale,
@@ -749,7 +776,9 @@ bool load_control_vectors(const Options& o, const strata::core::ModelGeometry& g
         ++steered;
     }
     if (steered == 0) { err = "the control vector has no direction in layers " + std::to_string(first) + ".." + std::to_string(last); return false; }
-    if (!strata::kernels::cvec_upload(dir, s, o.cvec_mode, first, last, N, g.hc, err)) return false;
+    std::vector<int> gpus;
+    for (int st = 0; st < strata::core::placement().stages(); ++st) gpus.push_back(strata::core::placement().device(st));
+    if (!strata::kernels::cvec_upload(dir, s, o.cvec_mode, first, last, N, g.hc, gpus, err)) return false;
     summary = std::string(o.cvec_mode == 0 ? "project" : "add") + ":" + std::to_string(first) + "-" + std::to_string(last) +
               (single >= 0 ? ":single" + std::to_string(single) : "");
     // the line llama.cpp's patched build prints, so a log shows the same thing
@@ -788,6 +817,258 @@ double probe_pcie_h2d_gbps() {
     cudaFree(d);
     cudaFreeHost(h);
     return bw;
+}
+
+/// The VRAM expert tier over the pipeline's GPUs (placement.hpp): one cache per GPU, holding only its stage's layers,
+/// with the slots numbered across them - stage s owns [first[s], first[s + 1]) - and the device address of every
+/// slot (what the verify window's plan and the prompt path read a resident expert from).
+struct VramTier {
+    std::vector<std::unique_ptr<strata::core::ExpertCache>> caches;
+    std::vector<int32_t> first{0};
+    std::vector<uint64_t> addr;
+
+    /// After the caches are opened: the slot numbering and the addresses.
+    void index() {
+        first.assign(1, 0);
+        addr.clear();
+        for (auto& c : caches) {
+            for (int32_t i = 0; i < (int32_t) c->slots(); ++i) addr.push_back((uint64_t) c->device_slot(i));
+            first.push_back(first.back() + (int32_t) c->slots());
+        }
+    }
+    int32_t slots() const { return first.back(); }
+    int stage_of_slot(int32_t slot) const {
+        int s = 0;
+        while (s + 1 < (int) caches.size() && slot >= first[(size_t) s + 1]) ++s;
+        return s;
+    }
+    int32_t slot_of(int64_t layer, int64_t expert) const {
+        const int s = strata::core::placement().stage_of(layer);
+        const int32_t local = caches[(size_t) s]->slot_of(layer, expert);
+        return local == strata::core::kNotResident ? local : first[(size_t) s] + local;
+    }
+    uint8_t* device_slot(int32_t slot) { return (uint8_t*) addr[(size_t) slot]; }
+    /// Stage s's slots from `slot` to its last one, in bytes: what the prompt path borrows from there.
+    uint64_t bytes_from(int s, int32_t slot) const {
+        const strata::core::ExpertCache& c = *caches[(size_t) s];
+        const int32_t local = slot - first[(size_t) s];
+        return c.slot_offsets() ? (uint64_t) (c.bytes() - (int64_t) c.slot_offsets()[local])
+                                : (uint64_t) (c.slots() - local) * (uint64_t) strata::kernels::cpu::expert_layout().max_blob;
+    }
+    int64_t bytes() const {
+        int64_t b = 0;
+        for (auto& c : caches) b += c->valid() ? c->bytes() : 0;
+        return b;
+    }
+};
+
+/// The VRAM tier's copies (the adaptive tier's swaps, the refill of the slots lent to the prompt path): a stream per
+/// GPU (a slot is filled on its own GPU) and the event its last copies recorded.
+struct RefillStreams {
+    struct Copy { void* dst; const void* src; size_t bytes; int stage; };
+    std::vector<cudaStream_t> cs;
+    std::vector<cudaEvent_t> ev;
+    std::vector<char> used;
+    std::thread worker;
+    std::atomic<bool> issuing{false}, failed{false};
+
+    bool init() {
+        const strata::core::Placement& pl = strata::core::placement();
+        for (int st = 0; st < pl.stages(); ++st) {
+            strata::core::DeviceGuard dg(pl.device(st));
+            cudaStream_t s = nullptr;
+            cudaEvent_t e = nullptr;
+            if (cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking) != cudaSuccess ||
+                cudaEventCreateWithFlags(&e, cudaEventDisableTiming) != cudaSuccess)
+                return false;
+            cs.push_back(s);
+            ev.push_back(e);
+        }
+        used.assign(cs.size(), 0);
+        return true;
+    }
+    ~RefillStreams() {
+        if (worker.joinable()) worker.join();
+    }
+    cudaStream_t stream(int st) { used[(size_t) st] = 1; return cs[(size_t) st]; }
+    void record() {
+        for (size_t st = 0; st < cs.size(); ++st)
+            if (used[st]) {
+                strata::core::DeviceGuard dg(strata::core::placement().device((int) st));
+                cudaEventRecord(ev[st], cs[st]);
+            }
+    }
+    /// Many copies at once, issued from a thread: a GPU on a slow link fills the driver's queue, and issuing them on
+    /// the caller's thread would hold it until most of them had landed.
+    void copy_async(std::vector<Copy> copies) {
+        if (worker.joinable()) worker.join();
+        for (const Copy& c : copies) used[(size_t) c.stage] = 1;
+        issuing = true;
+        worker = std::thread([this, copies = std::move(copies)] {
+            for (const Copy& c : copies)
+                if (cudaMemcpyAsync(c.dst, c.src, c.bytes, cudaMemcpyHostToDevice, cs[(size_t) c.stage]) != cudaSuccess)
+                    failed = true;
+            record();
+            issuing = false;
+        });
+    }
+    /// Whether the recorded copies have landed (waiting for them with `wait`); forgets them when they have.
+    bool done(bool wait) {
+        if (worker.joinable()) {
+            if (!wait && issuing.load()) return false;
+            worker.join();
+        }
+        for (size_t st = 0; st < cs.size(); ++st) {
+            if (!used[st]) continue;
+            if (wait) cudaEventSynchronize(ev[st]);
+            else if (cudaEventQuery(ev[st]) != cudaSuccess) return false;
+        }
+        used.assign(cs.size(), 0);
+        return true;
+    }
+};
+
+/// The PCIe share of the missed experts for every layer (/256).  `frac` is the share for the GPU with the fastest
+/// link; a GPU whose link moves `b` bytes/s where the fastest moves `b_max` gets the share that balances its link
+/// against the CPU the way `frac` balances the fastest one: b * frac / (b * frac + b_max * (1 - frac)).
+std::vector<int> pcie_shares(double frac, int64_t n_layers, const std::vector<double>& bw) {
+    const strata::core::Placement& pl = strata::core::placement();
+    const double b_max = *std::max_element(bw.begin(), bw.end());
+    frac = std::clamp(frac, 0.0, 1.0);
+    std::vector<int> num((size_t) n_layers, 0);
+    for (int64_t l = 0; l < n_layers; ++l) {
+        const double b = bw[(size_t) pl.stage_of(l)];
+        const double f = frac >= 1.0 ? 1.0 : b * frac / (b * frac + b_max * (1.0 - frac));
+        num[(size_t) l] = (int) (f * 256.0 + 0.5);
+    }
+    return num;
+}
+
+/// What each layer puts on its GPU, for choosing where the layers split: its dense weights and state, and all of its
+/// experts (what a cache holding the whole layer takes).  `last` is what only the last GPU holds (the head and the
+/// draft layer).
+struct LayerCosts {
+    std::vector<double> fixed, experts;
+    double last = 0.0;
+};
+
+/// Host-to-device bandwidth of each pipeline GPU, measured by `setup_placement` (bytes/s; one GPU: {1}).
+std::vector<double> g_link_bw{1.0};
+
+/// The pipeline (placement.hpp) from --gpus / --gpu-split.  Without a split the layers go where streaming the experts
+/// that do not fit in VRAM costs least: the split minimizes the time to move every non-resident expert once over
+/// its GPU's own link (what a prompt chunk streams), sum over GPUs of bytes / link bandwidth.  With equal links that
+/// sum does not depend on the split, and the layers go in proportion to the VRAM each GPU has free (less what only
+/// the last one holds); a GPU on a slower link gets the layers whose experts it can hold entirely.
+bool setup_placement(const Options& o, int64_t n_layers, const LayerCosts& lc, std::string& err) {
+    int count = 0;
+    if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0) { err = "no CUDA device is present"; return false; }
+    strata::core::Placement p;
+    p.devices.clear();
+    for (int64_t d : o.gpus) {
+        if (d >= count) {
+            err = "--gpus: there is no GPU " + std::to_string((long long) d) + " (" + std::to_string(count) + " present)";
+            return false;
+        }
+        p.devices.push_back((int) d);
+    }
+    const int n = p.stages();
+    for (int d : p.devices) {
+        // the stages share mapped host memory and the pinned expert arena by their host addresses
+        int ua = 0, hp = 0;
+        cudaDeviceGetAttribute(&ua, cudaDevAttrUnifiedAddressing, d);
+        cudaDeviceGetAttribute(&hp, cudaDevAttrCanUseHostPointerForRegisteredMem, d);
+        if (n > 1 && (!ua || !hp)) {
+            err = "GPU " + std::to_string(d) + " cannot read host memory at its host address (unified addressing)";
+            return false;
+        }
+    }
+    // each GPU's free VRAM and the bandwidth of its link, with a pinned host-to-device copy
+    std::vector<double> free_b((size_t) n, 0.0);
+    g_link_bw.assign((size_t) n, 1.0);
+    if (n > 1) {
+        const size_t bytes = 64u << 20;
+        void* h = nullptr;
+        if (cudaHostAlloc(&h, bytes, cudaHostAllocPortable) != cudaSuccess) { err = "cannot pin 64 MiB"; return false; }
+        for (int s = 0; s < n; ++s) {
+            strata::core::DeviceGuard dg(p.devices[(size_t) s]);
+            size_t f = 0, t = 0;
+            cudaFree(nullptr);
+            cudaMemGetInfo(&f, &t);
+            free_b[(size_t) s] = (double) f;
+            void* d = nullptr;
+            cudaEvent_t e0 = nullptr, e1 = nullptr;
+            if (cudaMalloc(&d, bytes) != cudaSuccess) { err = "cannot allocate 64 MiB on GPU " + std::to_string(p.devices[(size_t) s]); return false; }
+            cudaEventCreate(&e0);
+            cudaEventCreate(&e1);
+            cudaMemcpy(d, h, bytes, cudaMemcpyHostToDevice);   // the link wakes from its idle speed
+            cudaEventRecord(e0);
+            for (int r = 0; r < 2; ++r) cudaMemcpy(d, h, bytes, cudaMemcpyHostToDevice);
+            cudaEventRecord(e1);
+            cudaEventSynchronize(e1);
+            float ms = 0.0f;
+            cudaEventElapsedTime(&ms, e0, e1);
+            if (ms > 0.0f) g_link_bw[(size_t) s] = 2.0 * (double) bytes / ms * 1e3;
+            cudaEventDestroy(e0);
+            cudaEventDestroy(e1);
+            cudaFree(d);
+            std::fprintf(stderr, "strata generate: GPU %d: %.2f GiB free, reads host memory at %.1f GB/s\n",
+                         p.devices[(size_t) s], free_b[(size_t) s] / 1073741824.0, g_link_bw[(size_t) s] / 1e9);
+        }
+        cudaFreeHost(h);
+    }
+    p.bounds.assign(1, 0);
+    if (!o.gpu_split.empty()) {
+        if ((int) o.gpu_split.size() != n - 1) { err = "--gpu-split needs the first layer of every GPU after the first"; return false; }
+        p.bounds.insert(p.bounds.end(), o.gpu_split.begin(), o.gpu_split.end());
+    } else if (n > 1) {
+        // the room each GPU has for its layers: free, less a share for the per-GPU buffers, the reserve and (the
+        // last) the head and the draft layer
+        const double per_gpu = 512.0 * 1048576.0 + (double) o.vram_reserve_mib * 1048576.0;
+        std::vector<double> room((size_t) n), prop((size_t) n);
+        double total = 0.0;
+        for (int s = 0; s < n; ++s) {
+            room[(size_t) s] = std::max(0.0, free_b[(size_t) s] - per_gpu - (s == n - 1 ? lc.last : 0.0));
+            total += room[(size_t) s];
+        }
+        for (int s = 0; s < n; ++s) prop[(size_t) s] = total > 0.0 ? (double) n_layers * room[(size_t) s] / total : 0.0;
+        std::vector<double> F(1, 0.0), E(1, 0.0);   // prefix sums over the layers
+        for (int64_t l = 0; l < n_layers; ++l) {
+            F.push_back(F.back() + lc.fixed[(size_t) l]);
+            E.push_back(E.back() + lc.experts[(size_t) l]);
+        }
+        const double inf = std::numeric_limits<double>::infinity();
+        // stage s on layers [a, b): the seconds to stream its non-resident experts, and 1 ms per layer away from its
+        // proportional share (which decides when the links are equal)
+        auto cost = [&](int s, int64_t a, int64_t b) {
+            const double cap = room[(size_t) s] - (F[(size_t) b] - F[(size_t) a]);
+            if (cap < 0.0) return inf;
+            const double stream = std::max(0.0, E[(size_t) b] - E[(size_t) a] - cap);
+            return stream / g_link_bw[(size_t) s] + 1e-3 * std::fabs((double) (b - a) - prop[(size_t) s]);
+        };
+        const size_t L1 = (size_t) n_layers + 1;
+        std::vector<double> best((size_t) n * L1, inf);
+        std::vector<int64_t> from((size_t) n * L1, 0);
+        for (int64_t b = 1; b <= n_layers; ++b) best[(size_t) b] = cost(0, 0, b);
+        for (int s = 1; s < n; ++s)
+            for (int64_t b = s + 1; b <= n_layers; ++b)
+                for (int64_t a = s; a < b; ++a) {
+                    const double c = best[(size_t) (s - 1) * L1 + (size_t) a] + cost(s, a, b);
+                    if (c < best[(size_t) s * L1 + (size_t) b]) {
+                        best[(size_t) s * L1 + (size_t) b] = c;
+                        from[(size_t) s * L1 + (size_t) b] = a;
+                    }
+                }
+        if (!std::isfinite(best[(size_t) (n - 1) * L1 + (size_t) n_layers])) {
+            err = "the model's dense weights do not fit on these GPUs";
+            return false;
+        }
+        std::vector<int64_t> cut((size_t) n, n_layers);
+        for (int s = n - 1; s > 0; --s) cut[(size_t) s - 1] = from[(size_t) s * L1 + (size_t) cut[(size_t) s]];
+        for (int s = 0; s + 1 < n; ++s) p.bounds.push_back(cut[(size_t) s]);
+    }
+    p.bounds.push_back(n_layers);
+    return strata::core::set_placement(p, n_layers, err);
 }
 
 }  // namespace
@@ -981,6 +1262,11 @@ int main(int argc, char** argv) {
         else if (a == "--no-publish-kernel") o.no_publish_kernel = true;
         else if (a == "--no-fused-gdn") o.no_fused_gdn = true;
         else if (a == "--no-fast-select") o.no_fast_select = true;
+        else if (a == "--gpus" || a == "--gpu-split") {
+            std::string e;
+            std::vector<int64_t>& dst = a == "--gpus" ? o.gpus : o.gpu_split;
+            if (!parse_i64_list(next(a.c_str()), dst, e)) { std::fprintf(stderr, "%s: %s\n", a.c_str(), e.c_str()); return 2; }
+        }
         else {
             // An unknown flag is an ERROR and not a warning: a typo'd `--max-neww` that silently generated 16
             // tokens would look like a working run.
@@ -1122,25 +1408,6 @@ int main(int argc, char** argv) {
         }
     }
     const bool native_pack = strata::kernels::cpu::expert_layout().native;
-    // plan v0.3 P6: the PCIe share of the missed experts, measured per kind of pack (the paper, finding on PCIe).
-    // PR #44: a x8 link carries half of what the native default assumes - the GPU's SMs read that share over the
-    // link (the copy kernel, since 0.1.14), so on a slower link it must shrink or the window waits for it.  The
-    // real H2D bandwidth is probed once; from 20 GB/s up (x16 PCIe 4/5) the measured default stays.  The canonical
-    // pack's 0.2 was never measured against the link, so it is left alone.  `--calibrate` measures it outright.
-    if (o.pcie_frac < 0.0) {
-        const double base = native_pack ? 0.55 : 0.2;
-        const double bw = native_pack ? probe_pcie_h2d_gbps() : -1.0;
-        if (!native_pack) {
-            o.pcie_frac = base;
-        } else if (bw > 0.0) {
-            o.pcie_frac = bw >= 20.0 ? base : std::min(base, std::max(0.05, base * (bw / 26.0)));
-            std::fprintf(stderr, "strata generate: PCIe probe: %.1f GB/s host->device -> pcie_frac %.2f (default %.2f)\n",
-                         bw, o.pcie_frac, base);
-        } else {
-            o.pcie_frac = base;
-            std::fprintf(stderr, "strata generate: PCIe probe failed -> pcie_frac default %.2f\n", base);
-        }
-    }
     // the canonical Q2_0 pack's CPU kernels are AVX-512 only; a native pack runs on AVX2 CPUs as well
     if (!native_pack) strata::kernels::cpu::cpu_require_expert_support();
     else if (!strata::kernels::cpu::cpu_avx512_ok())
@@ -1169,36 +1436,126 @@ int main(int argc, char** argv) {
     // Plan v0.3 P1: tensors served in native form are not also loaded in canonical form (~2.7 GB of VRAM back
     // to the expert cache with --native).  `--keep-canonical` loads both, as before.
     std::set<std::string> skip;
+    std::map<std::string, uint64_t> native_bytes;   // the tensors NativeDense puts on the GPUs
+    if (!o.native_dense_gguf.empty() &&
+        !strata::core::NativeDense::served_bytes(o.native_dense_gguf, o.native_ple_key, native_bytes, err)) {
+        std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+        return 1;
+    }
     if (!o.keep_canonical) {
-        if (!o.native_dense_gguf.empty() &&
-            !strata::core::NativeDense::served_names(o.native_dense_gguf, o.native_ple_key, skip, err)) {
-            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
-            return 1;
-        }
+        for (const auto& nb : native_bytes) skip.insert(nb.first);
         if (!o.native_head_gguf.empty()) skip.insert("output.weight");
         // the PLE module validates its canonical key at construction (8 MB); a native pack has none to load
         if (!native_pack) skip.erase("blk.1.ple_key.weight");
         if (native_pack) skip.insert("token_embd.weight");
     }
-    uint64_t pool_bytes = 0;
+    // ---- the GPUs, before anything is allocated on one (placement.hpp)
+    {
+        const strata::core::ModelGeometry g0;
+        LayerCosts lc;
+        lc.fixed.assign((size_t) g0.n_layers, 0.0);
+        lc.experts.assign((size_t) g0.n_layers, 0.0);
+        std::map<std::string, uint64_t> canonical;
+        if (!strata::core::WeightTable::tensor_bytes(o.pack, canonical, err)) {
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+            return 1;
+        }
+        auto layer_of = [&](const std::string& name) -> int64_t {
+            return name.rfind("blk.", 0) == 0 ? std::strtoll(name.c_str() + 4, nullptr, 10) : -1;
+        };
+        for (const auto& [name, b] : canonical)
+            if (!skip.count(name) && layer_of(name) >= 0 && layer_of(name) < g0.n_layers)
+                lc.fixed[(size_t) layer_of(name)] += (double) b;
+        for (const auto& [name, b] : native_bytes)
+            if (layer_of(name) >= 0 && layer_of(name) < g0.n_layers) lc.fixed[(size_t) layer_of(name)] += (double) b;
+        const auto& lay0 = strata::kernels::cpu::expert_layout();
+        for (int64_t l = 0; l < g0.n_layers; ++l) {
+            lc.fixed[(size_t) l] += strata::core::is_qsa_layer(g0, l)
+                                        ? (double) strata::core::qsa_state_bytes(g0, o.max_context, false)
+                                        : (double) strata::core::gdn_state_floats(g0) * 4.0;
+            lc.experts[(size_t) l] = (double) lay0.n_expert * (double) ((lay0.blob_bytes(l) + 255) / 256 * 256);
+        }
+        // what only the last GPU holds: the native head and the MTP draft layer
+        if (!o.native_head_gguf.empty()) {
+            try {
+                strata::GgufFile f(o.native_head_gguf);
+                for (const strata::TensorInfo& t : f.tensors())
+                    if (t.name == "output.weight" && t.shape.size() == 2 && strata::kernels::native_mmvq_supported((int) t.type))
+                        lc.last += (double) strata::kernels::native_mmvq_weight_bytes((int) t.type, (int) t.shape[0],
+                                                                                    (int) t.shape[1]);
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "strata generate: %s\n", e.what());
+                return 1;
+            }
+        }
+        if (!o.mtp.empty())
+            for (const char* f : {"/dense.bin", "/experts.bin"}) {
+                std::error_code ec;
+                const uintmax_t b = std::filesystem::file_size(o.mtp + f, ec);
+                if (!ec) lc.last += (double) b;
+            }
+        if (!setup_placement(o, g0.n_layers, lc, err)) {
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+            return 2;
+        }
+        const strata::core::Placement& pl = strata::core::placement();
+        if (pl.stages() > 1 && !native_pack) {
+            std::fprintf(stderr, "strata generate: more than one GPU needs a native (IQ) pack (tools/iq_pack.py)\n");
+            return 2;
+        }
+        cudaSetDevice(pl.device(0));   // what is not a stage's own (the canonical token path) goes to the first GPU
+        if (pl.stages() > 1)
+            for (int s = 0; s < pl.stages(); ++s)
+                std::fprintf(stderr, "strata generate: GPU %d runs layers %lld-%lld%s\n", pl.device(s), (long long) pl.first(s),
+                             (long long) (pl.end(s) - 1), s == pl.last() ? " and the head" : "");
+    }
+    // plan v0.3 P6: the PCIe share of the missed experts, measured per kind of pack (the paper, finding on PCIe).
+    // PR #44: a x8 link carries half of what the native default assumes - the GPU's SMs read that share over the
+    // link (the copy kernel, since 0.1.14), so on a slower link it must shrink or the window waits for it.  The
+    // real H2D bandwidth is probed once; from 20 GB/s up (x16 PCIe 4/5) the measured default stays.  The canonical
+    // pack's 0.2 was never measured against the link, so it is left alone.  `--calibrate` measures it outright.
+    // With more than one GPU the fastest link (measured by setup_placement) sets it, and each GPU's layers take a
+    // share for their own link (pcie_shares).
+    if (o.pcie_frac < 0.0) {
+        const double base = native_pack ? 0.55 : 0.2;
+        const double bw = !native_pack ? -1.0
+                        : strata::core::placement().stages() > 1 ? *std::max_element(g_link_bw.begin(), g_link_bw.end()) / 1e9
+                                                                 : probe_pcie_h2d_gbps();
+        if (!native_pack) {
+            o.pcie_frac = base;
+        } else if (bw > 0.0) {
+            o.pcie_frac = bw >= 20.0 ? base : std::min(base, std::max(0.05, base * (bw / 26.0)));
+            std::fprintf(stderr, "strata generate: PCIe probe: %.1f GB/s host->device -> pcie_frac %.2f (default %.2f)\n",
+                         bw, o.pcie_frac, base);
+        } else {
+            o.pcie_frac = base;
+            std::fprintf(stderr, "strata generate: PCIe probe failed -> pcie_frac default %.2f\n", base);
+        }
+    }
+    std::vector<uint64_t> pool_bytes;
     if (!strata::core::WeightTable::pool_bytes(o.pack, pool_bytes, err, skip.empty() ? nullptr : &skip)) {
         std::fprintf(stderr, "strata generate: %s\n", err.c_str());
         return 1;
     }
-    void* arena = nullptr;
-    if (cudaMalloc(&arena, pool_bytes) != cudaSuccess) {
-        std::fprintf(stderr, "strata generate: cudaMalloc(%llu) for the weight arena failed\n",
-                     (unsigned long long) pool_bytes);
-        return 1;
+    std::vector<void*> arenas(pool_bytes.size(), nullptr);   // one per GPU, for its layers' tensors
+    uint64_t pool_total = 0;
+    for (size_t s = 0; s < arenas.size(); ++s) {
+        strata::core::DeviceGuard dg(strata::core::placement().device((int) s));
+        if (pool_bytes[s] > 0 && cudaMalloc(&arenas[s], pool_bytes[s]) != cudaSuccess) {
+            std::fprintf(stderr, "strata generate: cudaMalloc(%llu) for the weight arena failed\n",
+                         (unsigned long long) pool_bytes[s]);
+            return 1;
+        }
+        pool_total += pool_bytes[s];
     }
     strata::core::WeightTable wt;
-    if (!wt.load(o.pack, arena, pool_bytes, err, skip.empty() ? nullptr : &skip)) {
+    if (!wt.load(o.pack, arenas, pool_bytes, err, skip.empty() ? nullptr : &skip)) {
         std::fprintf(stderr, "strata generate: %s\n", err.c_str());
         return 1;
     }
     std::fprintf(stderr, "strata generate: %llu MiB of weights loaded from %s (%zu canonical tensors skipped: "
                          "served natively)\n",
-                 (unsigned long long) (pool_bytes >> 20), o.pack.c_str(), skip.size());
+                 (unsigned long long) (pool_total >> 20), o.pack.c_str(), skip.size());
 
     strata::core::NativeDense native_dense;
     if (!o.native_dense_gguf.empty()) {
@@ -1232,20 +1589,33 @@ int main(int argc, char** argv) {
     strata::kernels::native_rope_set_enabled(o.native_rope);
     // The vision path: every rope kernel reads a cell's (t, h, w) from this table (strata/kernels/mrope.hpp).  It is
     // the identity until an image request, and it is set here, before any CUDA graph captures a rope kernel.
-    int32_t* d_mrope = nullptr;
+    std::vector<int32_t*> d_mrope;   // one per GPU
     std::vector<int32_t> mrope_host;
+    auto upload_mrope = [&]() -> bool {
+        for (int32_t* t : d_mrope)
+            if (cudaMemcpy(t, mrope_host.data(), mrope_host.size() * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess)
+                return false;
+        return true;
+    };
     if (o.vision) {
         const int64_t cells = o.max_context + 64;
         mrope_host.resize((size_t) cells * 3);
         for (int64_t c = 0; c < cells; ++c)
             mrope_host[(size_t) c * 3] = mrope_host[(size_t) c * 3 + 1] = mrope_host[(size_t) c * 3 + 2] = (int32_t) c;
-        if (cudaMalloc(&d_mrope, mrope_host.size() * sizeof(int32_t)) != cudaSuccess ||
-            cudaMemcpy(d_mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t), cudaMemcpyHostToDevice) !=
-                cudaSuccess) {
+        for (int st = 0; st < strata::core::placement().stages(); ++st) {
+            strata::core::DeviceGuard dg(strata::core::placement().device(st));
+            int32_t* t = nullptr;
+            if (cudaMalloc(&t, mrope_host.size() * sizeof(int32_t)) != cudaSuccess) {
+                std::fprintf(stderr, "strata generate: cannot allocate the image position table\n");
+                return 1;
+            }
+            d_mrope.push_back(t);
+            strata::kernels::mrope_table_set(t);
+        }
+        if (!upload_mrope()) {
             std::fprintf(stderr, "strata generate: cannot allocate the image position table\n");
             return 1;
         }
-        strata::kernels::mrope_table_set(d_mrope);
     }
     strata::kernels::ple_set_native_postops(o.native_ple_postops);
     strata::core::ModelGeometry g;   // canonical defaults; the model file overrides the MoE shape below
@@ -1278,10 +1648,15 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    void* sbuf = nullptr;
-    if (cudaMalloc(&sbuf, strata::core::session_bytes(g, o.max_context, K)) != cudaSuccess) {
-        std::fprintf(stderr, "strata generate: session state allocation failed\n");
-        return 1;
+    std::vector<void*> sbufs;   // each GPU's share of the session
+    for (int st = 0; st < strata::core::placement().stages(); ++st) {
+        strata::core::DeviceGuard dg(strata::core::placement().device(st));
+        void* b = nullptr;
+        if (cudaMalloc(&b, strata::core::session_bytes(g, o.max_context, K, st)) != cudaSuccess) {
+            std::fprintf(stderr, "strata generate: session state allocation failed\n");
+            return 1;
+        }
+        sbufs.push_back(b);
     }
     strata::core::SessionState ss;
     // **THE ENGINE RAN ON THE LEGACY DEFAULT STREAM, WHICH ON WDDM IS THE SLOW PATH.**  All four session
@@ -1297,7 +1672,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     void* const main_cs = (void*) main_stream;
-    if (strata::core::session_init(g, o.max_context, K, sbuf, ss) == 0) {
+    if (!strata::core::session_init(g, o.max_context, K, sbufs, ss)) {
         std::fprintf(stderr, "strata generate: session_init failed\n");
         return 1;
     }
@@ -1327,7 +1702,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: cannot pin the half-dump staging buffer\n");
             return 1;
         }
-        ss.block.dump = half_stage;
+        ss.stages[0].block.dump = half_stage;
     }
 
     strata::core::Doorbell db;
@@ -1398,6 +1773,8 @@ int main(int argc, char** argv) {
         ss.ple.prev = ss.ple_prev;
         ss.ple.hist = ss.ple_hist;
         ss.ple.emb_host = ple_emb_host.data();
+        // on layer 1's GPU, beside its weights and the PLE history
+        strata::core::DeviceGuard dg(strata::core::placement().device(strata::core::placement().stage_of(1)));
         if (cudaMalloc((void**) &ple_emb_dev, (size_t) strata::kernels::NG_N_EMBD * 4) != cudaSuccess ||
             cudaMalloc((void**) &ple_scratch, strata::core::ple_run_scratch_bytes()) != cudaSuccess) {
             std::fprintf(stderr, "strata generate: the PLE buffers failed\n");
@@ -1485,7 +1862,12 @@ int main(int argc, char** argv) {
     // sees the memory this process actually has left rather than the card's idle figure - and refuses with both
     // numbers if the slots do not fit, instead of handing back a cache smaller than it was asked for.
     mem_mark("the weights, the session and the drafter");
-    strata::core::ExpertCache xcache;
+    const strata::core::Placement& pl = strata::core::placement();
+    const int n_stages = pl.stages();
+    VramTier tier;
+    for (int st = 0; st < n_stages; ++st) tier.caches.push_back(std::make_unique<strata::core::ExpertCache>());
+    // the one-GPU token paths (the canonical pack) use the first GPU's cache directly
+    strata::core::ExpertCache& xcache = *tier.caches[0];
     std::vector<std::pair<int32_t, int32_t>> profile;
     if (!o.expert_profile.empty()) {
         int64_t pslots = 0;
@@ -1500,6 +1882,9 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: profile %s: %zu ranked pairs, built for %lld slots\n",
                      o.expert_profile.c_str(), profile.size(), (long long) pslots);
     }
+    // each GPU's share of the ranked list: the pairs of its own layers, in rank order
+    std::vector<std::vector<std::pair<int32_t, int32_t>>> stage_profile((size_t) n_stages);
+    for (const auto& pr : profile) stage_profile[(size_t) pl.stage_of(pr.first)].push_back(pr);
     // THE HEAD BEFORE THE CACHE.  The expert cache takes what is free minus the reserve, so everything allocated
     // after it comes out of the reserve.  The native head (~0.5 GB with IQ3_S) was loaded after it and ate most of
     // the 700 MiB: 128K IQ3_S ended with 30 MiB free, the driver paged, and a request stalled for good at its first
@@ -1509,6 +1894,7 @@ int main(int argc, char** argv) {
     const int64_t n_vocab = wo->ne1;
     strata::core::NativeHead native_head;
     if (!o.native_head_gguf.empty()) {
+        strata::core::DeviceGuard dg(pl.device(pl.last()));   // the last stage runs the head
         if (!native_head.load(o.native_head_gguf, g.n_embd, n_vocab, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
@@ -1523,80 +1909,95 @@ int main(int argc, char** argv) {
         return 1;
     }
     const bool auto_cache = o.expert_cache < 0;
-    if (o.expert_cache < 0) {
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    // Plan v0.3 P5: the batched prompt path's chunk buffers are allocated later, so they are reserved here - under
+    // WDDM an over-subscribed allocation does not fail, it pages to system memory and crawls.  (with borrowing -
+    // the default with a profile - the prompt path lends cache slots instead)
+    const bool borrow_slots = !o.no_prefill_borrow && !o.expert_profile.empty();
+    const int64_t prefill_mib = (o.prefill_chunk > 0 && !borrow_slots) ? 160 + (o.prefill_chunk * 680) / 1024 : 0;
+    const int64_t reserve = ((int64_t) o.vram_reserve_mib + prefill_mib) << 20;
+    std::vector<int64_t> want_slots((size_t) n_stages, 0);
+    for (int st = 0; st < n_stages; ++st) {
+        strata::core::DeviceGuard dg(pl.device(st));
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
-        // Plan v0.3 P5: the batched prompt path's chunk buffers are allocated later, so they are reserved here -
-        // under WDDM an over-subscribed allocation does not fail, it pages to system memory and crawls.
-        // (with borrowing - the default with a profile - the prompt path lends cache slots instead)
-        const bool borrow = !o.no_prefill_borrow && !o.expert_profile.empty();
-        const int64_t prefill_mib = (o.prefill_chunk > 0 && !borrow) ? 160 + (o.prefill_chunk * 680) / 1024 : 0;
-        const int64_t reserve = ((int64_t) o.vram_reserve_mib + prefill_mib) << 20;
-        int64_t slots = ((int64_t) free_b - reserve) / (int64_t) strata::kernels::cpu::expert_layout().max_blob;
-        if (!profile.empty()) slots = std::min<int64_t>(slots, (int64_t) profile.size());
-        o.expert_cache = (int) std::max<int64_t>(slots, 0);
-        std::fprintf(stderr, "strata generate: expert cache auto: %.2f GiB free, %d MiB reserved -> %d slots\n",
-                     (double) free_b / 1073741824.0, o.vram_reserve_mib, o.expert_cache);
+        int64_t slots = 0;
+        if (auto_cache) {
+            slots = ((int64_t) free_b - reserve) / (int64_t) lay.max_blob;
+            if (!profile.empty()) slots = std::min<int64_t>(slots, (int64_t) stage_profile[(size_t) st].size());
+            std::fprintf(stderr, "strata generate: expert cache auto: GPU %d: %.2f GiB free, %d MiB reserved -> %lld slots\n",
+                         pl.device(st), (double) free_b / 1073741824.0, o.vram_reserve_mib,
+                         (long long) std::max<int64_t>(slots, 0));
+        } else {
+            // an explicit number of slots is shared by the GPUs in proportion to their layers
+            slots = (int64_t) o.expert_cache * (pl.end(st) - pl.first(st)) / g.n_layers;
+        }
+        want_slots[(size_t) st] = std::max<int64_t>(slots, 0);
     }
     // plan v0.3 P6: a native pack's blobs differ per layer, so with a profile its slots are sized per pair: the
     // same VRAM holds ~30% more IQ3_XXS experts than slots of the largest blob would
-    std::vector<int64_t> sized_slots;
-    if (native_pack && o.expert_cache > 0 && !profile.empty()) {
+    std::vector<std::vector<int64_t>> sized_slots((size_t) n_stages);
+    for (int st = 0; st < n_stages && native_pack && !profile.empty(); ++st) {
+        if (want_slots[(size_t) st] <= 0) continue;
+        strata::core::DeviceGuard dg(pl.device(st));
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
-        const auto& lay = strata::kernels::cpu::expert_layout();
-        const uint64_t budget = (uint64_t) o.expert_cache * lay.max_blob;   // what the uniform sizing granted
+        const uint64_t budget = (uint64_t) want_slots[(size_t) st] * lay.max_blob;   // what the uniform sizing granted
         uint64_t used = 0;
         size_t free_room = free_b > ((size_t) o.vram_reserve_mib << 20) ? free_b - ((size_t) o.vram_reserve_mib << 20) : 0;
         const uint64_t cap = std::min<uint64_t>(budget, (uint64_t) free_room);
-        for (const auto& pr : profile) {
+        for (const auto& pr : stage_profile[(size_t) st]) {
             const uint64_t b = (lay.blob_bytes(pr.first) + 255) / 256 * 256;
             if (used + b > cap) break;
             used += b;
-            sized_slots.push_back((int64_t) lay.blob_bytes(pr.first));
+            sized_slots[(size_t) st].push_back((int64_t) lay.blob_bytes(pr.first));
         }
-        o.expert_cache = (int) sized_slots.size();
+        want_slots[(size_t) st] = (int64_t) sized_slots[(size_t) st].size();
     }
-    if (o.expert_cache > 0) {
-        // keep the first `keep_bytes` of the cache (the profile's hottest experts first); false when nothing is left
-        auto shrink_to = [&](int64_t keep_bytes) -> bool {
-            if (keep_bytes <= 0) { o.expert_cache = 0; sized_slots.clear(); return false; }
-            if (!sized_slots.empty()) {
-                int64_t used = 0;
-                size_t keep = 0;
-                while (keep < sized_slots.size() && used + (sized_slots[keep] + 255) / 256 * 256 <= keep_bytes)
-                    used += (sized_slots[keep++] + 255) / 256 * 256;
-                sized_slots.resize(keep);
-                o.expert_cache = (int) keep;
-            } else {
-                o.expert_cache = (int) (keep_bytes / (int64_t) strata::kernels::cpu::expert_layout().max_blob);
-            }
-            if (o.expert_cache <= 0) { o.expert_cache = 0; sized_slots.clear(); return false; }
-            return true;
-        };
-        auto cache_bytes = [&]() -> int64_t {
-            if (sized_slots.empty()) return (int64_t) o.expert_cache * (int64_t) strata::kernels::cpu::expert_layout().max_blob;
-            int64_t b = 0;
-            for (const int64_t s : sized_slots) b += (s + 255) / 256 * 256;
-            return b;
-        };
+    for (int st = 0; st < n_stages; ++st) {
         // With `--expert-cache auto` the reserve must still be free once the slots are WRITTEN: under WDDM an
         // allocation is not resident until it is touched, and the free figure read before it can be ~1 GB too
         // high.  A cache sized from it filled the card to 0 MiB, the driver then paged, and a request that needed a
         // page back while the verify graph spun on a host flag never finished.  So the slots are zeroed and the
         // free figure read again; while it is short of the reserve the cache is reopened smaller.
+        strata::core::ExpertCache& cache = *tier.caches[(size_t) st];
+        std::vector<int64_t>& sized = sized_slots[(size_t) st];
+        int64_t& want = want_slots[(size_t) st];
+        strata::core::DeviceGuard dg(pl.device(st));
+        // keep the first `keep_bytes` of this GPU's cache (the profile's hottest experts first); false when nothing is left
+        auto shrink_to = [&](int64_t keep_bytes) -> bool {
+            if (keep_bytes <= 0) { want = 0; sized.clear(); return false; }
+            if (!sized.empty()) {
+                int64_t used = 0;
+                size_t keep = 0;
+                while (keep < sized.size() && used + (sized[keep] + 255) / 256 * 256 <= keep_bytes)
+                    used += (sized[keep++] + 255) / 256 * 256;
+                sized.resize(keep);
+                want = (int64_t) keep;
+            } else {
+                want = keep_bytes / (int64_t) lay.max_blob;
+            }
+            if (want <= 0) { want = 0; sized.clear(); return false; }
+            return true;
+        };
+        auto cache_bytes = [&]() -> int64_t {
+            if (sized.empty()) return want * (int64_t) lay.max_blob;
+            int64_t b = 0;
+            for (const int64_t s : sized) b += (s + 255) / 256 * 256;
+            return b;
+        };
         // STRATA_TEST_CACHE_FAIL=N: the first N opens fail as an out-of-commit cudaMalloc does (tests the retry)
         int fake_fails = std::getenv("STRATA_TEST_CACHE_FAIL") ? std::atoi(std::getenv("STRATA_TEST_CACHE_FAIL")) : 0;
         int failed = 0;
-        for (int attempt = 0;; ++attempt) {
+        for (int attempt = 0; want > 0; ++attempt) {
             bool ok = false;
             if (fake_fails > 0) {
                 --fake_fails;
                 err = "ExpertCache: cudaMalloc failed: out of memory (STRATA_TEST_CACHE_FAIL)";
             } else {
-                ok = sized_slots.empty()
-                    ? xcache.open(o.expert_cache, g.n_layers, g.n_expert, (int64_t) strata::kernels::cpu::expert_layout().max_blob, err)
-                    : xcache.open_sized(sized_slots, g.n_layers, g.n_expert, err);
+                ok = sized.empty()
+                    ? cache.open(want, g.n_layers, g.n_expert, (int64_t) lay.max_blob, err, pl.device(st))
+                    : cache.open_sized(sized, g.n_layers, g.n_expert, err, pl.device(st));
             }
             if (!ok) {
                 // Issue #60: on Windows a device allocation is also charged to the system commit (RAM + page file),
@@ -1612,8 +2013,8 @@ int main(int argc, char** argv) {
 #endif
                 if (auto_cache && failed < 8 && shrink_to(cache_bytes() / 4 * 3)) {
                     ++failed;
-                    std::fprintf(stderr, "strata generate: %s%s; trying a smaller expert cache: %d slots\n", err.c_str(),
-                                 commit, o.expert_cache);
+                    std::fprintf(stderr, "strata generate: %s%s; trying a smaller expert cache on GPU %d: %lld slots\n",
+                                 err.c_str(), commit, pl.device(st), (long long) want);
                     continue;
                 }
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
@@ -1625,29 +2026,33 @@ int main(int argc, char** argv) {
                 return 1;
             }
             if (!auto_cache || attempt - failed >= 6) break;
-            cudaMemset(xcache.device_slot(0), 0, (size_t) xcache.bytes());
+            cudaMemset(cache.device_slot(0), 0, (size_t) cache.bytes());
             cudaDeviceSynchronize();
             size_t free_b = 0, total_b = 0;
             cudaMemGetInfo(&free_b, &total_b);
-            const int64_t want = (int64_t) o.vram_reserve_mib << 20;
-            if ((int64_t) free_b >= want - (64ll << 20)) break;
-            // short by (want - free); a figure of 0 only says "at least", so then give back a quarter as well
-            int64_t give = want - (int64_t) free_b + (64ll << 20);
-            if (free_b < ((size_t) 16 << 20)) give = std::max<int64_t>(give, xcache.bytes() / 4);
-            const int64_t keep_bytes = xcache.bytes() - give;
-            std::fprintf(stderr, "strata generate: only %lld MiB free once the slots are written (reserve %d MiB); "
-                                 "shrinking the expert cache\n", (long long) (free_b >> 20), o.vram_reserve_mib);
-            xcache.close();
+            const int64_t reserve_b = (int64_t) o.vram_reserve_mib << 20;
+            if ((int64_t) free_b >= reserve_b - (64ll << 20)) break;
+            // short by (reserve - free); a figure of 0 only says "at least", so then give back a quarter as well
+            int64_t give = reserve_b - (int64_t) free_b + (64ll << 20);
+            if (free_b < ((size_t) 16 << 20)) give = std::max<int64_t>(give, cache.bytes() / 4);
+            const int64_t keep_bytes = cache.bytes() - give;
+            std::fprintf(stderr, "strata generate: only %lld MiB free on GPU %d once the slots are written (reserve %d "
+                                 "MiB); shrinking the expert cache\n", (long long) (free_b >> 20), pl.device(st),
+                         o.vram_reserve_mib);
+            cache.close();
             if (!shrink_to(keep_bytes)) break;
         }
-        if (failed > 0 && o.expert_cache > 0)
-            std::fprintf(stderr, "strata generate: expert cache: %d slots (%.2f GiB) after %d smaller tries - a bigger "
-                                 "page file lets it use more of the free VRAM\n",
-                         o.expert_cache, (double) xcache.bytes() / 1073741824.0, failed);
+        if (failed > 0 && want > 0)
+            std::fprintf(stderr, "strata generate: expert cache on GPU %d: %lld slots (%.2f GiB) after %d smaller tries - "
+                                 "a bigger page file lets it use more of the free VRAM\n",
+                         pl.device(st), (long long) want, cache.gib(), failed);
     }
+    tier.index();
+    o.expert_cache = (int) tier.slots();
     if (o.expert_cache > 0) {
-        std::fprintf(stderr, "strata generate: expert cache %lld slots, %.2f GiB of VRAM; policy is\n",
-                     (long long) xcache.slots(), xcache.gib());
+        for (int st = 0; st < n_stages; ++st)
+            std::fprintf(stderr, "strata generate: expert cache %lld slots, %.2f GiB of VRAM on GPU %d; policy is\n",
+                         (long long) tier.caches[(size_t) st]->slots(), tier.caches[(size_t) st]->gib(), pl.device(st));
         mem_mark("opening the expert cache");
         xcache.set_per_layer_admission(o.expert_cache_per_layer);
         // Round 328 warned here that the GPU hit path was wrong (tokens diverged from a cache-off run from
@@ -1674,34 +2079,38 @@ int main(int argc, char** argv) {
     // ---- R4.2e: fill the tier from the profile.  This is the only place the plan is applied, and it runs
     // ONCE: with `slots` pairs and `slots` slots the cache is full when this returns, so the decode-time
     // admission finds no room and every non-profiled expert stays a CPU miss.  That is what makes the profile
-    // the policy rather than a hint.
+    // the policy rather than a hint.  Each GPU takes the top pairs of its own layers.
     int64_t prefilled = 0;
-    if (!profile.empty() && srcp != nullptr) {
-        const int64_t want = std::min<int64_t>((int64_t) profile.size(), xcache.slots());
+    for (int st = 0; st < n_stages && !profile.empty() && srcp != nullptr; ++st) {
+        strata::core::ExpertCache& cache = *tier.caches[(size_t) st];
+        const auto& sp = stage_profile[(size_t) st];
+        const int64_t want = std::min<int64_t>((int64_t) sp.size(), cache.slots());
+        int64_t filled = 0;
         for (int64_t i = 0; i < want; ++i) {
-            const int32_t slot = xcache.admit(profile[(size_t) i].first, profile[(size_t) i].second);
+            const int32_t slot = cache.admit(sp[(size_t) i].first, sp[(size_t) i].second);
             if (slot == strata::core::kNotResident) break;
-            const uint8_t* b = srcp->blob(profile[(size_t) i].first, profile[(size_t) i].second);
-            if (b == nullptr || !xcache.fill_slot_blocking(slot, b, err,
-                    (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first))) {
-                std::fprintf(stderr, "strata generate: the profile fill failed at pair %lld: %s\n",
-                             (long long) i, err.c_str());
+            const uint8_t* b = srcp->blob(sp[(size_t) i].first, sp[(size_t) i].second);
+            if (b == nullptr || !cache.fill_slot_blocking(slot, b, err, (int64_t) lay.blob_bytes(sp[(size_t) i].first))) {
+                std::fprintf(stderr, "strata generate: the profile fill failed at pair %lld: %s\n", (long long) i,
+                             err.c_str());
                 return 1;
             }
-            ++prefilled;
+            ++filled;
         }
         // **AND ONE SLOT IS READ BACK AND COMPARED.**  A residency table that is right about indices and wrong
         // about bytes produces a plausible token, which is this project's most expensive failure mode; the
         // cache's own `verify_slot` is the check and it costs one 1.38 MB D2H at startup.
-        if (prefilled > 0 && !xcache.verify_slot(xcache.slot_of(profile[0].first, profile[0].second),
-                                srcp->blob(profile[0].first, profile[0].second), err,
-                                (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile[0].first))) {
+        if (filled > 0 && !cache.verify_slot(cache.slot_of(sp[0].first, sp[0].second), srcp->blob(sp[0].first, sp[0].second),
+                                             err, (int64_t) lay.blob_bytes(sp[0].first))) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
+        prefilled += filled;
+    }
+    if (!profile.empty() && srcp != nullptr) {
         mem_mark("the profile fill");
         std::fprintf(stderr, "strata generate: pre-filled %lld of %lld slots from the profile; slot 0 verified\n",
-                     (long long) prefilled, (long long) want);
+                     (long long) prefilled, (long long) tier.slots());
     }
 
     Drive drive;
@@ -1738,12 +2147,12 @@ int main(int argc, char** argv) {
         drive.d.cache_stream = main_cs;
         drive.d.cache_base = (const uint8_t*) xcache.device_slot(0);
         drive.d.cache_blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
-        drive.d.cache_slot_off = xcache.slot_offsets();
+        drive.d.slot_addr = tier.addr.data();
         drive.d.hit_scratch = hit_scratch;
         drive.d.parts_out = d_parts;
         drive.d.hit_out = d_hit_out;
         drive.d.parts_elems = K * g.n_embd;
-        drive.d.mixed = ss.block.mixed;
+        drive.d.mixed = ss.stages[0].block.mixed;
         drive.d.x_q8_0_hit = d_hit_q8;
         drive.d.x_q8_0_hit_scale = d_hit_q8_scale;
         drive.d.d_slot = d_hit_slot;
@@ -1879,9 +2288,9 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "strata generate: session is up (engine %s)\n", STRATA_VERSION);
     auto run_head = [&](void* stream) -> bool {
         if (!native_head.loaded())
-            return strata::core::lm_head(wt, g, ss.block, d_logits, stream, err);
-        return strata::core::lm_head_mix(wt, g, ss.block, stream, err) &&
-               native_head.run(ss.block.mixed, d_logits, stream, err);
+            return strata::core::lm_head(wt, g, ss.stages[0].block, d_logits, stream, err);
+        return strata::core::lm_head_mix(wt, g, ss.stages[0].block, stream, err) &&
+               native_head.run(ss.stages[0].block.mixed, d_logits, stream, err);
     };
     float* d_emb = nullptr;
     if (cudaMalloc(&d_emb, (size_t) g.n_embd * 4) != cudaSuccess) {
@@ -1912,7 +2321,7 @@ int main(int argc, char** argv) {
             strata::core::session_zero(ss, g, d_emb, token_stream);
         } else {
             for (int64_t c = 0; c < g.hc; ++c)
-                if (cudaMemcpyAsync(ss.R + (size_t) c * g.n_embd, d_emb, (size_t) g.n_embd * 4,
+                if (cudaMemcpyAsync(ss.stages[0].block.R + (size_t) c * g.n_embd, d_emb, (size_t) g.n_embd * 4,
                                     cudaMemcpyDeviceToDevice, (cudaStream_t) token_stream) != cudaSuccess) {
                     std::fprintf(stderr, "strata generate: the residual broadcast failed\n");
                     return false;
@@ -2278,7 +2687,7 @@ int main(int argc, char** argv) {
         int64_t resident = 0;
         for (int64_t l = 0; l < g.n_layers; ++l)
             for (int64_t e = 0; e < g.n_expert; ++e) {
-                const int32_t slot = xcache.slot_of(l, e);
+                const int32_t slot = tier.slot_of(l, e);
                 host_res[(size_t) (l * g.n_expert + e)] = slot;
                 if (slot != strata::core::kNotResident) ++resident;
             }
@@ -2360,28 +2769,34 @@ int main(int argc, char** argv) {
             }
         strata::prefill::Prefill::set_pinned_share(total ? (double) pinned / (double) total : 1.0);
     }
-    auto lend_slots = [&](int64_t c) -> int64_t {
-        const uint64_t need = strata::prefill::Prefill::bytes_needed(g, ss, c);
+    // The slots GPU `st` lends the prompt path for a chunk of `c` tokens: taken from the end of its own slots until
+    // they hold its buffers.
+    auto lend_slots = [&](int st, int64_t c) -> int64_t {
+        const uint64_t need = strata::prefill::Prefill::bytes_needed(g, ss, c, st);
+        const strata::core::ExpertCache& cache = *tier.caches[(size_t) st];
         const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
         int64_t k = (int64_t) ((need + (uint64_t) blob - 1) / (uint64_t) blob);
-        if (xcache.slot_offsets() != nullptr) {   // sized slots: take slots from the end until they hold `need`
+        if (cache.slot_offsets() != nullptr) {   // sized slots: take slots from the end until they hold `need`
             k = 0;
-            while (k < xcache.slots() &&
-                   (uint64_t) (xcache.bytes() - (int64_t) xcache.slot_offsets()[xcache.slots() - k]) < need) ++k;
+            while (k < cache.slots() &&
+                   (uint64_t) (cache.bytes() - (int64_t) cache.slot_offsets()[cache.slots() - k]) < need) ++k;
         }
         return k;
     };
-    auto lend_bytes = [&](int32_t first) -> uint64_t {
-        return xcache.slot_offsets() ? (uint64_t) (xcache.bytes() - (int64_t) xcache.slot_offsets()[first])
-                                     : (uint64_t) (xcache.slots() - first) *
-                                           (uint64_t) strata::kernels::cpu::expert_layout().max_blob;
+    // what the prompt path borrows when every GPU lends from its slot `first[st]` on
+    auto borrows_from = [&](const std::vector<int32_t>& first) {
+        std::vector<strata::prefill::Prefill::Borrow> b;
+        for (int st = 0; st < n_stages; ++st)
+            b.push_back({tier.device_slot(first[(size_t) st]), tier.bytes_from(st, first[(size_t) st])});
+        return b;
     };
     // The prompt path's chunk and the slots it borrows for its buffers: the requested chunk halved until it fits,
     // or with --prefill auto the largest of kAutoChunks whose buffers take at most kAutoLendPct % of the slots (a
     // lent slot's expert is streamed during the prompt and refilled after it; measured on a 12 GB card, 32K Q2_0
     // prompt: 4096 791 tok/s, 6144 878, 8192 973 with 69% of the slots lent).  A request lends only what its own
-    // prompt needs (Prefill::relayout), so a big chunk costs short prompts nothing.  0 = none fits.
-    auto plan_lend = [&](int64_t& chunk) -> int64_t {
+    // prompt needs (Prefill::relayout), so a big chunk costs short prompts nothing.  Every GPU must be able to lend
+    // its share; the result is the first slot each lends, empty when none fits.
+    auto plan_lend = [&](int64_t& chunk) -> std::vector<int32_t> {
         static constexpr int64_t kAutoChunks[] = {8192, 6144, 4096, 3072, 2048, 1024, 512, 256};
         // at 8192-token chunks nearly every expert streams anyway, so a lent slot costs little: 90% when the
         // copies are DMA from pinned RAM (Q2_0 8192 + a 384-slot ring: 1283 tok/s), 85% when host copies are the
@@ -2391,19 +2806,38 @@ int main(int argc, char** argv) {
             return v ? (int64_t) std::atoi(v)
                      : (int64_t) (strata::prefill::Prefill::pinned_share() >= 0.9 ? 90 : 85);
         }();
-        auto slots_for = lend_slots;
-        if (o.prefill_auto) {
-            for (const int64_t c : kAutoChunks) {
-                const int64_t k = slots_for(c);
-                if (k + 128 <= xcache.slots() && k * 100 <= kAutoLendPct * xcache.slots()) { chunk = c; return k; }
+        auto fits = [&](int64_t c, bool cap_pct, std::vector<int32_t>& first) {
+            first.clear();
+            for (int st = 0; st < n_stages; ++st) {
+                const int64_t k = lend_slots(st, c), n = tier.caches[(size_t) st]->slots();
+                if (k + 128 > n || (cap_pct && k * 100 > kAutoLendPct * n)) return false;
+                first.push_back(tier.first[(size_t) st + 1] - (int32_t) k);
             }
-            return 0;
+            return true;
+        };
+        std::vector<int32_t> first;
+        if (o.prefill_auto) {
+            for (const int64_t c : kAutoChunks)
+                if (fits(c, true, first)) { chunk = c; return first; }
+            return {};
         }
-        for (int64_t c = chunk; c >= 256; c /= 2) {
-            const int64_t k = slots_for(c);
-            if (k + 128 <= xcache.slots()) { chunk = c; return k; }
-        }
-        return 0;
+        for (int64_t c = chunk; c >= 256; c /= 2)
+            if (fits(c, false, first)) { chunk = c; return first; }
+        return {};
+    };
+    // the prompt path's chunk for `tokens` fresh tokens: at most `max` and no bigger than they need; with more than one
+    // GPU at least two chunks once each holds 2,048 tokens, so the GPUs read different chunks at once (measured on
+    // two GPUs: 6,844 tokens 536 tok/s as one chunk, 596-606 as two to four; 1,097 tokens 381 as one, 361 as two)
+    auto chunk_for = [&](int64_t tokens, int64_t max) {
+        int64_t c = std::min<int64_t>(max, (tokens + 255) / 256 * 256);
+        if (n_stages > 1 && tokens >= 2 * 2048)
+            c = std::min<int64_t>(c, std::max<int64_t>(2048, ((tokens + 1) / 2 + 255) / 256 * 256));
+        return c;
+    };
+    auto lent_slots = [&](const std::vector<int32_t>& first) {
+        int64_t n = 0;
+        for (int st = 0; st < n_stages; ++st) n += tier.first[(size_t) st + 1] - first[(size_t) st];
+        return n;
     };
     if (o.serve) {
         if (o.spec < 2 || o.mtp.empty() || o.prefill_chunk <= 0 ||
@@ -2413,38 +2847,37 @@ int main(int argc, char** argv) {
             return 2;
         }
         strata::prefill::Prefill sp;
-        void* borrow = nullptr;
-        uint64_t borrow_bytes = 0;
-        int32_t lend_first = -1;          // the first slot the prompt path may borrow (its largest chunk)
-        int32_t lend_first_now = -1;      // where its buffers are laid out now
+        std::vector<strata::prefill::Prefill::Borrow> borrow;
+        std::vector<int32_t> lend_first;      // per GPU: the first slot the prompt path may borrow (its largest chunk)
+        std::vector<int32_t> lend_first_now;  // where its buffers are laid out now
         // a cache too small to lend the prompt path its buffers would make it allocate them on top - on a card the
         // cache already filled to its reserve, that is the over-subscription the auto sizing avoids - so the
         // prompt chunk is halved until its buffers fit in the lendable slots (a smaller chunk only reads slower)
         if (!o.no_prefill_borrow && d_res != nullptr) {
             int64_t chunk = o.prefill_chunk;
-            if (const int64_t k = plan_lend(chunk); k > 0) {
+            lend_first = plan_lend(chunk);
+            if (!lend_first.empty()) {
                 if (o.prefill_auto)
                     std::fprintf(stderr, "strata serve: prompt chunk auto: %lld tokens\n", (long long) chunk);
                 else if (chunk != o.prefill_chunk)
                     std::fprintf(stderr, "strata serve: prompt chunk %lld -> %lld tokens so its buffers fit in the "
                                          "expert cache\n", (long long) o.prefill_chunk, (long long) chunk);
                 o.prefill_chunk = chunk;
-                lend_first = (int32_t) (xcache.slots() - k);
                 lend_first_now = lend_first;
-                borrow = xcache.device_slot(lend_first);
-                borrow_bytes = xcache.slot_offsets()
-                                   ? (uint64_t) (xcache.bytes() - (int64_t) xcache.slot_offsets()[lend_first])
-                                   : (uint64_t) k * (uint64_t) strata::kernels::cpu::expert_layout().max_blob;
+                borrow = borrows_from(lend_first);
             } else if (o.prefill_auto) {
                 o.prefill_chunk = 1024;   // nothing lendable: small buffers of its own
             }
         }
-        if (borrow != nullptr)
+        if (!borrow.empty()) {
+            uint64_t bytes = 0;
+            for (const auto& b : borrow) bytes += b.bytes;
             std::fprintf(stderr, "strata serve: the prompt path borrows %lld cache slots (%.2f GiB)\n",
-                         (long long) (xcache.slots() - lend_first), (double) borrow_bytes / 1073741824.0);
-        else
+                         (long long) lent_slots(lend_first), (double) bytes / 1073741824.0);
+        } else {
             std::fprintf(stderr, "strata serve: the prompt path allocates its own buffers (too few cache slots to borrow)\n");
-        if (!sp.init(wt, g, ss, srcp, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow, borrow_bytes)) {
+        }
+        if (!sp.init(wt, g, ss, srcp, tier.addr.data(), host_res.data(), o.prefill_chunk, err, borrow)) {
             std::fprintf(stderr, "strata serve: %s\n", err.c_str());
             return 1;
         }
@@ -2507,7 +2940,7 @@ int main(int argc, char** argv) {
             ConvCheckpoint c;
             c.ids.assign(cur.begin(), cur.begin() + L);
             c.imgs = imgs_below(req_imgs, L);
-            if (cudaDeviceSynchronize() != cudaSuccess || !checkpoint_save(c, ss, g)) return false;
+            if (!strata::core::session_sync(ss) || !checkpoint_save(c, ss, g)) return false;
             c.used = ++check_clock;
             checks.push_back(std::move(c));
             while ((int) checks.size() > o.prompt_cache) {
@@ -2518,6 +2951,14 @@ int main(int argc, char** argv) {
                                                                                    o.prompt_cache);
                 checks.erase(checks.begin() + (std::ptrdiff_t) victim);
             }
+            return true;
+        };
+        // the chunk ends where on_chunk saves a checkpoint, found ahead by the same rule (the prompt path's first GPU
+        // waits there for the others, so the checkpoint has every layer at that position)
+        int64_t hold_next = 0;
+        sp.hold_at = [&](int64_t end) {
+            if (o.prompt_cache <= 0 || o.prompt_cache_every <= 0 || end < hold_next) return false;
+            hold_next = end + o.prompt_cache_every;
             return true;
         };
         sp.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
@@ -2539,25 +2980,41 @@ int main(int argc, char** argv) {
             return true;
         };
         drive.d.plan = ver.plan_sink();
-        drive.d.pcie_num = std::max(0, std::min(256, (int) (o.pcie_frac * 256.0 + 0.5)));
+        drive.d.pcie_num = pcie_shares(o.pcie_frac, g.n_layers, g_link_bw);
         if (o.adapt_every > 0 && o.adapt_swaps > 0) drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
-        cudaStream_t adapt_stream = nullptr;
-        if (cudaStreamCreateWithFlags(&adapt_stream, cudaStreamNonBlocking) != cudaSuccess) {
+        RefillStreams refills;
+        if (!refills.init()) {
             std::fprintf(stderr, "strata serve: cannot create the refill stream\n");
             return 1;
         }
-        // plan v0.3 P6: swaps in flight - (residency index, slot) admitted when adapt_ev has completed
+        // plan v0.3 P6: swaps in flight - (residency index, slot) admitted when their copies have landed
         std::vector<std::pair<int32_t, int32_t>> pending;
-        cudaEvent_t adapt_ev = nullptr;
-        cudaEventCreateWithFlags(&adapt_ev, cudaEventDisableTiming);
         auto apply_pending = [&](bool wait) {
             if (pending.empty()) return;
-            if (wait) cudaEventSynchronize(adapt_ev);
-            else if (cudaEventQuery(adapt_ev) != cudaSuccess) return;
+            if (!refills.done(wait)) return;
+            if (refills.failed) {   // a slot that did not get its expert must never be read as holding it
+                std::fprintf(stderr, "strata generate: a copy into the VRAM expert tier failed\n");
+                std::fflush(stderr);
+                std::abort();
+            }
             for (const auto& [i, slot] : pending) host_res[(size_t) i] = slot;
             pending.clear();
             if (d_res != nullptr)
                 cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+        };
+        // lent slots back to their experts: copies on each slot's GPU, admitted by apply_pending
+        auto refill_async = [&](const std::vector<std::pair<int32_t, int32_t>>& slots, std::string& e) -> bool {
+            std::vector<RefillStreams::Copy> copies;
+            for (const auto& [i, slot] : slots) {
+                const uint8_t* b = srcp->blob(i / g.n_expert, i % g.n_expert);
+                if (b == nullptr) { e = "refilling a lent slot failed: the expert source has no blob"; return false; }
+                copies.push_back({tier.device_slot(slot), b,
+                                  (size_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert),
+                                  tier.stage_of_slot(slot)});
+                pending.emplace_back(i, slot);
+            }
+            refills.copy_async(std::move(copies));
+            return true;
         };
         // the VRAM tier follows the conversation (the same rule as the speculative loop below)
         auto adapt = [&]() -> bool {
@@ -2591,13 +3048,13 @@ int main(int argc, char** argv) {
                 const int32_t slot = host_res[out];
                 const uint8_t* b = srcp->blob(s.layer, s.in);
                 if (slot < 0 || b == nullptr ||
-                    cudaMemcpyAsync(xcache.device_slot(slot), b, (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer),
-                                    cudaMemcpyHostToDevice, adapt_stream) != cudaSuccess)
+                    cudaMemcpyAsync(tier.device_slot(slot), b, (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer),
+                                    cudaMemcpyHostToDevice, refills.stream(tier.stage_of_slot(slot))) != cudaSuccess)
                     return false;
                 host_res[out] = strata::core::kNotResident;   // evicted now: the CPU computes it meanwhile
                 pending.emplace_back((int32_t) in, slot);      // resident once the copy has landed
             }
-            if (!swaps.empty()) cudaEventRecord(adapt_ev, adapt_stream);
+            if (!swaps.empty()) refills.record();
             for (float& v : drive.d.usage) v *= 0.7f;
             return true;
         };
@@ -2667,33 +3124,49 @@ int main(int argc, char** argv) {
         {
             // what is left once everything is allocated: under WDDM a GPU filled to the brim does not fail, it pages -
             // and a page-in while the verify graph spins on a host flag stalls the request for good
-            size_t free_b = 0, total_b = 0;
-            cudaMemGetInfo(&free_b, &total_b);
-            // below ~256 MiB a later allocation (a first-used window's buffers, the desktop, another program) can make
-            // the driver page GPU memory, and a verify graph spinning on a host flag then never finishes
-            const int64_t free_mib = (int64_t) (free_b >> 20);
-            if (free_mib >= 256) {
-                std::fprintf(stderr, "strata serve: %lld MiB of VRAM free with everything loaded\n", (long long) free_mib);
-            } else {
-                std::fprintf(stderr, "strata serve: %lld MiB of VRAM free with everything loaded - LOW: requests may stall;"
-                                     " add --vram-reserve-mib %lld to the config's args (or lower --max-context)\n",
-                             (long long) free_mib, (long long) (o.vram_reserve_mib + 512 - free_mib));
+            for (int st = 0; st < n_stages; ++st) {
+                strata::core::DeviceGuard dg(pl.device(st));
+                size_t free_b = 0, total_b = 0;
+                cudaMemGetInfo(&free_b, &total_b);
+                // below ~256 MiB a later allocation (a first-used window's buffers, the desktop, another program) can
+                // make the driver page GPU memory, and a verify graph spinning on a host flag then never finishes
+                const int64_t free_mib = (int64_t) (free_b >> 20);
+                if (free_mib >= 256) {
+                    std::fprintf(stderr, "strata serve: %lld MiB of VRAM free on GPU %d with everything loaded\n",
+                                 (long long) free_mib, pl.device(st));
+                } else {
+                    std::fprintf(stderr, "strata serve: %lld MiB of VRAM free on GPU %d with everything loaded - LOW: requests "
+                                         "may stall; add --vram-reserve-mib %lld to the config's args (or lower --max-context)\n",
+                                 (long long) free_mib, pl.device(st), (long long) (o.vram_reserve_mib + 512 - free_mib));
+                }
             }
         }
         // what the server's Monitor tab shows (servers before 0.1.8 skip unknown lines until READY)
         {
-            size_t free_b = 0, total_b = 0;
-            cudaMemGetInfo(&free_b, &total_b);
+            size_t free_b = 0;
+            for (int st = 0; st < n_stages; ++st) {
+                strata::core::DeviceGuard dg(pl.device(st));
+                size_t f = 0, t = 0;
+                cudaMemGetInfo(&f, &t);
+                free_b += f;
+            }
+            // the GPUs by PCI bus id (the Monitor reads them through NVML, which numbers GPUs its own way)
+            std::string bus;
+            for (int st = 0; st < n_stages; ++st) {
+                char id[32] = {0};
+                cudaDeviceGetPCIBusId(id, (int) sizeof id, pl.device(st));
+                bus += (st ? "," : "") + std::string(id);
+            }
             std::printf("INFO context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld spec=%d "
                         "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
-                        "spec_min_p=%.2f engine=" STRATA_VERSION "\n",
+                        "spec_min_p=%.2f gpus=%s engine=" STRATA_VERSION "\n",
                         (long long) o.max_context, o.kv.c_str(),
                         (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[0].kv_mode == 1
                                          ? ss.qsa_states[0].n_slots * 4 : 0),
-                        (long long) xcache.slots(), (long long) (xcache.bytes() >> 20), o.spec, o.mtp_max_t,
+                        (long long) tier.slots(), (long long) (tier.bytes() >> 20), o.spec, o.mtp_max_t,
                         o.suffix_draft, (long long) (free_b >> 20), cvec_summary.c_str(),
                         (long long) (strata::kernels::cpu::expert_layout().total >> 20), pool.workers(), o.pcie_frac,
-                        o.spec_min_p);
+                        o.spec_min_p, bus.c_str());
         }
         // issue #29: a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on
         // a flag nobody will raise - end the engine with where it was, so the server starts it again instead of the
@@ -2871,15 +3344,13 @@ int main(int argc, char** argv) {
                     for (int64_t c = n; ve.empty() && c < cells; ++c) put(c, p + (c - n), p + (c - n), p + (c - n));
                 }
                 tr("positions built", (long long) img_rows.size());
-                cudaDeviceSynchronize();
+                strata::core::session_sync(ss);
                 tr("device idle");
-                if (ve.empty() && cudaMemcpy(d_mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t),
-                                             cudaMemcpyHostToDevice) != cudaSuccess)
-                    ve = "the image position upload failed";
+                if (ve.empty() && !upload_mrope()) ve = "the image position upload failed";
                 if (!ve.empty()) {
                     // leave the table as the identity so the next text request is untouched
                     for (int64_t c = 0; c < cells; ++c) put(c, c, c, c);
-                    cudaMemcpy(d_mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+                    upload_mrope();
                     mrope_identity = true;
                     std::printf("ERR %s\n", ve.c_str());
                     std::fflush(stdout);
@@ -2970,6 +3441,7 @@ int main(int argc, char** argv) {
             pp_from = read_from;
             pp_t0 = r0;
             pp_next_check = reread_to > 0 ? INT64_MAX : resume + o.prompt_cache_every;
+            hold_next = pp_next_check;
             std::printf("RESUME %lld\n", (long long) resume);   // before reading: this many prompt tokens are reused
             strata::core::progress_at("reading the prompt, from token", read_from);
             std::fflush(stdout);
@@ -3025,37 +3497,39 @@ int main(int argc, char** argv) {
             // reads - so the windows always see the whole expert cache - or once the prompt is read
             std::vector<std::pair<int32_t, int32_t>> lent_now;
             int64_t lent_chunk = 0;   // the chunk the lent slots hold the prompt path's buffers for
+            // the refill is a copy per GPU on its own stream, and a slot is resident again once its copy has landed
+            // (as the adaptive tier's swaps are): a GPU on a slow link needs seconds for its slots.  With static
+            // residency it completes here, so every run sees the same residency.
             auto refill = [&](std::string& e) -> bool {
                 if (lent_now.empty()) return true;
                 tr("refill start", (long long) lent_now.size());
-                for (const auto& [i, slot] : lent_now) {
-                    const uint8_t* b = srcp->blob(i / g.n_expert, i % g.n_expert);
-                    if (b == nullptr || !xcache.fill_slot_blocking(slot, b, e,
-                            (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert)))
-                        return false;
-                    host_res[(size_t) i] = slot;
-                }
-                cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+                if (!refill_async(lent_now, e)) return false;
                 lent_now.clear();
                 lent_chunk = 0;
+                apply_pending(drive.d.usage.empty());
                 return true;
             };
-            // lend the slots `tokens` batched prompt tokens need: the prompt path's buffers for min(chunk, tokens
-            // rounded up to 256), laid out in the last of the slots it may borrow
+            // lend the slots `tokens` batched prompt tokens need: the prompt path's buffers for their chunk
+            // (chunk_for), laid out in the last of the slots it may borrow
             auto lend = [&](int64_t tokens, std::string& e) -> bool {
-                if (lend_first < 0) return true;                       // its own buffers: nothing to lend
-                const int64_t want = std::min<int64_t>(o.prefill_chunk, (tokens + 255) / 256 * 256);
+                if (lend_first.empty()) return true;                   // its own buffers: nothing to lend
+                const int64_t want = chunk_for(tokens, o.prefill_chunk);
                 if (!lent_now.empty()) {
-                    if (want <= lent_chunk) return true;
+                    if (want <= lent_chunk)                            // fits in the slots lent already
+                        return want == sp.chunk() || sp.relayout(want, borrows_from(lend_first_now), e);
                     if (!refill(e)) return false;
                 }
-                const int32_t first = std::max<int32_t>(lend_first, (int32_t) (xcache.slots() - lend_slots(want)));
+                apply_pending(true);   // no copy may still be landing in a slot the prompt path is about to use
+                std::vector<int32_t> first((size_t) n_stages);
+                for (int st = 0; st < n_stages; ++st)
+                    first[(size_t) st] = std::max<int32_t>(lend_first[(size_t) st],
+                                                           tier.first[(size_t) st + 1] - (int32_t) lend_slots(st, want));
                 if (want != sp.chunk() || first != lend_first_now) {
-                    if (!sp.relayout(want, xcache.device_slot(first), lend_bytes(first), e)) return false;
+                    if (!sp.relayout(want, borrows_from(first), e)) return false;
                     lend_first_now = first;
                 }
                 for (size_t i = 0; i < host_res.size(); ++i)
-                    if (host_res[i] >= first) {
+                    if (host_res[i] >= 0 && host_res[i] >= first[(size_t) tier.stage_of_slot(host_res[i])]) {
                         lent_now.emplace_back((int32_t) i, host_res[i]);
                         host_res[i] = strata::core::kNotResident;
                     }
@@ -3079,7 +3553,7 @@ int main(int argc, char** argv) {
             req_sp.penalty_present = req_penalty_present;
             req_sp.counter = 0;
             ver.set_sampling(req_sp);
-            drive.d.pcie_num = std::max(0, std::min(256, (int) (req_pcie_frac * 256.0 + 0.5)));
+            drive.d.pcie_num = pcie_shares(req_pcie_frac, g.n_layers, g_link_bw);
             const int hist_n = std::min(req_sp.penalty_last_n, kPenaltyWindowCap);
             ver.set_history(hist_n > 0 ? d_hist : nullptr, hist_n);
             bool cancelled = false;
@@ -3270,7 +3744,7 @@ int main(int argc, char** argv) {
             if (state_hash && live_ok) {
                 // DEBUG: a fingerprint of every part of the session over the positions it holds ([0, L)), and
                 // separately of what lies past them in the last KV page (stale cells, fine unless something reads them)
-                cudaDeviceSynchronize();
+                strata::core::session_sync(ss);
                 const int64_t L = (int64_t) live.size();
                 const strata::kernels::QsaShapes qs = [&] {
                     strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
@@ -3294,13 +3768,14 @@ int main(int argc, char** argv) {
                     return h;
                 };
                 const ConvStateSizes z = conv_state_sizes(g);
-                uint64_t h_gdn = hash_dev(ss.gdn_state, z.gdn, 1469598103934665603ull);
+                const size_t per = z.gdn / (size_t) g.n_gdn_layers();
+                uint64_t h_gdn = 1469598103934665603ull;
+                for (int64_t i = 0; i < g.n_gdn_layers(); ++i) h_gdn = hash_dev(ss.gdn_states[(size_t) i], per, h_gdn);
                 if (std::getenv("STRATA_STATE_HASH_GDN") != nullptr) {   // per GDN layer: which one differs first
-                    const size_t per = z.gdn / (size_t) g.n_gdn_layers();
                     std::string s;
                     char b[8];
                     for (int64_t i = 0; i < g.n_gdn_layers(); ++i) {
-                        std::snprintf(b, sizeof(b), "%04llx ", (unsigned long long) (hash_dev((const uint8_t*) ss.gdn_state + i * per, per, 1469598103934665603ull) & 0xffff));
+                        std::snprintf(b, sizeof(b), "%04llx ", (unsigned long long) (hash_dev(ss.gdn_states[(size_t) i], per, 1469598103934665603ull) & 0xffff));
                         s += b;
                     }
                     std::fprintf(stderr, "strata serve: STATE_HASH_GDN %s\n", s.c_str());
@@ -3395,43 +3870,40 @@ int main(int argc, char** argv) {
     std::vector<float> final_r_host(final_r ? (size_t) (g.hc * g.n_embd) : 0);
     std::vector<std::pair<int32_t, int32_t>> lent;     // (residency index, slot) lent to the prompt path
     if (o.prefill_chunk > 0 && n_prompt > 1) {
-        void* borrow = nullptr;
-        uint64_t borrow_bytes = 0;
+        std::vector<strata::prefill::Prefill::Borrow> borrow;
         if (!o.no_prefill_borrow && !host_res.empty() && d_res != nullptr) {
             int64_t chunk = o.prefill_chunk;
-            int64_t k = plan_lend(chunk);             // auto: the largest chunk that fits; fixed: halved to fit
-            if (k > 0 && chunk > (n_prompt - 1 + 255) / 256 * 256) {   // no bigger than the prompt needs
-                chunk = std::max<int64_t>(256, (n_prompt - 1 + 255) / 256 * 256);
-                k = lend_slots(chunk);
+            std::vector<int32_t> first = plan_lend(chunk);   // auto: the largest chunk that fits; fixed: halved to fit
+            if (!first.empty() && chunk > chunk_for(n_prompt - 1, chunk)) {   // no bigger than the prompt needs
+                chunk = chunk_for(n_prompt - 1, chunk);
+                for (int st = 0; st < n_stages; ++st)
+                    first[(size_t) st] = tier.first[(size_t) st + 1] - (int32_t) lend_slots(st, chunk);
                 if (!o.prefill_auto) o.prefill_chunk = chunk;
             }
             if (o.prefill_auto) {
-                o.prefill_chunk = k > 0 ? chunk : 1024;
+                o.prefill_chunk = !first.empty() ? chunk : 1024;
                 std::fprintf(stderr, "strata generate: prompt chunk auto: %lld tokens\n", (long long) o.prefill_chunk);
             } else if (chunk != o.prefill_chunk) {
-                k = 0;                                 // a fixed chunk that does not fit: its own buffers, as before
+                first.clear();                         // a fixed chunk that does not fit: its own buffers, as before
             }
-            const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
-            if (k > 0) {   // the lent slots are refilled after the prompt
-                const int32_t first = (int32_t) (xcache.slots() - k);
+            if (!first.empty()) {   // the lent slots are refilled after the prompt
                 for (size_t i = 0; i < host_res.size(); ++i)
-                    if (host_res[i] >= first) {
+                    if (host_res[i] >= 0 && host_res[i] >= first[(size_t) tier.stage_of_slot(host_res[i])]) {
                         lent.emplace_back((int32_t) i, host_res[i]);
                         host_res[i] = strata::core::kNotResident;
                     }
                 cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
-                borrow = xcache.device_slot(first);
-                borrow_bytes = xcache.slot_offsets() ? (uint64_t) (xcache.bytes() - (int64_t) xcache.slot_offsets()[first])
-                                                     : (uint64_t) k * (uint64_t) blob;
-                std::fprintf(stderr, "strata generate: prompt path borrows %lld cache slots (%.2f GiB)\n", (long long) k,
-                             (double) borrow_bytes / 1073741824.0);
+                borrow = borrows_from(first);
+                uint64_t bytes = 0;
+                for (const auto& bw : borrow) bytes += bw.bytes;
+                std::fprintf(stderr, "strata generate: prompt path borrows %lld cache slots (%.2f GiB)\n",
+                             (long long) lent_slots(first), (double) bytes / 1073741824.0);
             }
         }
-        if (borrow == nullptr)
+        if (borrow.empty())
             std::fprintf(stderr, "strata generate: prompt path allocates its own buffers (no cache slots to borrow)\n");
-        if (!prefill.init(wt, g, ss, srcp, o.expert_cache > 0 ? &xcache : nullptr,
-                          host_res.empty() ? nullptr : host_res.data(), o.prefill_chunk, main_cs, err, borrow,
-                          borrow_bytes)) {
+        if (!prefill.init(wt, g, ss, srcp, o.expert_cache > 0 ? tier.addr.data() : nullptr,
+                          host_res.empty() ? nullptr : host_res.data(), o.prefill_chunk, err, borrow)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
@@ -3453,22 +3925,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
-        // refill the lent slots from the arena and give them back to the decode tier
-        if (!lent.empty()) {
-            const Clock::time_point tr = Clock::now();
-            for (const auto& [i, slot] : lent) {
-                const uint8_t* b = srcp->blob(i / g.n_expert, i % g.n_expert);
-                if (b == nullptr || !xcache.fill_slot_blocking(slot, b, err,
-                        (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert))) {
-                    std::fprintf(stderr, "strata generate: refilling a lent slot failed: %s\n", err.c_str());
-                    return 1;
-                }
-                host_res[(size_t) i] = slot;
-            }
-            cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
-            std::fprintf(stderr, "strata generate: %zu lent slots refilled in %.1f ms\n", lent.size(),
-                         std::chrono::duration<double, std::milli>(Clock::now() - tr).count());
-        }
+        // (the lent slots are refilled when the speculative loop starts)
         prefill_batched_ms = std::chrono::duration<double, std::milli>(Clock::now() - tp0).count();
         prefill_ms += prefill_batched_ms;
         pos_start = n_batched;
@@ -3564,7 +4021,7 @@ int main(int argc, char** argv) {
             }
         }
         if (final_r != nullptr) {
-            cudaMemcpy(final_r_host.data(), ss.R, final_r_host.size() * sizeof(float), cudaMemcpyDeviceToHost);
+            cudaMemcpy(final_r_host.data(), ss.stages[0].block.R, final_r_host.size() * sizeof(float), cudaMemcpyDeviceToHost);
             const int64_t posrec[2] = {pos, tok};
             std::fwrite(posrec, sizeof posrec, 1, final_r);
             std::fwrite(final_r_host.data(), sizeof(float), final_r_host.size(), final_r);
@@ -3745,31 +4202,53 @@ int main(int argc, char** argv) {
         // kernel needs no host CUDA call there, and costs ~1-3% decode on IQ3_S (45.3 -> 44.8 tok/s, 8 requests).
         ver.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
         drive.d.plan = ver.plan_sink();
-        drive.d.pcie_num = (int) (o.pcie_frac * 256.0 + 0.5);
-        if (drive.d.pcie_num < 0) drive.d.pcie_num = 0;
-        if (drive.d.pcie_num > 256) drive.d.pcie_num = 256;
+        drive.d.pcie_num = pcie_shares(o.pcie_frac, g.n_layers, g_link_bw);
         const int64_t pcie0 = drive.d.pcie_experts;
         if (o.adapt_every > 0 && o.adapt_swaps > 0) drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
         int64_t swaps_total = 0;
         double ms_adapt = 0;
-        cudaStream_t adapt_stream = nullptr;
-        if (!drive.d.usage.empty() && cudaStreamCreateWithFlags(&adapt_stream, cudaStreamNonBlocking) != cudaSuccess) {
+        RefillStreams refills;
+        if (!refills.init()) {
             std::fprintf(stderr, "strata generate: cannot create the refill stream\n");
             return 1;
         }
-        // plan v0.3 P6: swaps in flight - (residency index, slot) admitted when adapt_ev has completed
+        // plan v0.3 P6: swaps in flight - (residency index, slot) admitted when their copies have landed
         std::vector<std::pair<int32_t, int32_t>> pending;
-        cudaEvent_t adapt_ev = nullptr;
-        cudaEventCreateWithFlags(&adapt_ev, cudaEventDisableTiming);
         auto apply_pending = [&](bool wait) {
             if (pending.empty()) return;
-            if (wait) cudaEventSynchronize(adapt_ev);
-            else if (cudaEventQuery(adapt_ev) != cudaSuccess) return;
+            if (!refills.done(wait)) return;
+            if (refills.failed) {   // a slot that did not get its expert must never be read as holding it
+                std::fprintf(stderr, "strata generate: a copy into the VRAM expert tier failed\n");
+                std::fflush(stderr);
+                std::abort();
+            }
             for (const auto& [i, slot] : pending) host_res[(size_t) i] = slot;
             pending.clear();
             if (d_res != nullptr)
                 cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
         };
+        // the slots lent to the prompt path back to their experts: a copy per GPU on its own stream, and a slot is
+        // resident again once its copy has landed (with static residency before the first window)
+        if (!lent.empty()) {
+            const Clock::time_point tr = Clock::now();
+            std::vector<RefillStreams::Copy> copies;
+            for (const auto& [i, slot] : lent) {
+                const uint8_t* b = srcp->blob(i / g.n_expert, i % g.n_expert);
+                if (b == nullptr) {
+                    std::fprintf(stderr, "strata generate: refilling a lent slot failed: the expert source has no blob\n");
+                    return 1;
+                }
+                copies.push_back({tier.device_slot(slot), b,
+                                  (size_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert),
+                                  tier.stage_of_slot(slot)});
+                pending.emplace_back(i, slot);
+            }
+            refills.copy_async(std::move(copies));
+            apply_pending(drive.d.usage.empty());
+            std::fprintf(stderr, "strata generate: %zu lent slots %s in %.1f ms\n", lent.size(),
+                         pending.empty() ? "refilled" : "refilling in the background, issued",
+                         std::chrono::duration<double, std::milli>(Clock::now() - tr).count());
+        }
         // Plan v0.3 P6: the VRAM tier follows the conversation.  Candidates are missing experts routed at least
         // twice (decayed); each is paired with its layer's least-routed resident expert and swapped when it was
         // routed clearly more often.  Copies run between rounds, when the GPU is idle.
@@ -3806,15 +4285,15 @@ int main(int argc, char** argv) {
                 const uint8_t* b = srcp->blob(s.layer, s.in);
                 // asynchronous: the copies run while the MTP drafts; the next window waits for them
                 if (slot < 0 || b == nullptr ||
-                    cudaMemcpyAsync(xcache.device_slot(slot), b, (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer),
-                                    cudaMemcpyHostToDevice, adapt_stream) != cudaSuccess) {
+                    cudaMemcpyAsync(tier.device_slot(slot), b, (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer),
+                                    cudaMemcpyHostToDevice, refills.stream(tier.stage_of_slot(slot))) != cudaSuccess) {
                     std::fprintf(stderr, "strata generate: an adaptive refill failed\n");
                     return false;
                 }
                 host_res[out] = strata::core::kNotResident;   // evicted now: the CPU computes it meanwhile
                 pending.emplace_back((int32_t) in, slot);      // resident once the copy has landed
             }
-            if (!swaps.empty()) cudaEventRecord(adapt_ev, adapt_stream);
+            if (!swaps.empty()) refills.record();
             for (float& v : drive.d.usage) v *= 0.7f;
             swaps_total += (int64_t) swaps.size();
             ms_adapt += std::chrono::duration<double, std::milli>(Clock::now() - ta).count();
@@ -3829,7 +4308,7 @@ int main(int argc, char** argv) {
         // generated token and the MTP's first cell); otherwise the token loop already did that.
         bool first_window = native_pack;
         if (use_mtp && !first_window &&
-            !mtp.draft_first(o.spec, ss.R, x, p - 1, drafts.data(), err, dprob.data(), (float) o.spec_min_p)) {
+            !mtp.draft_first(o.spec, ss.stages[0].block.R, x, p - 1, drafts.data(), err, dprob.data(), (float) o.spec_min_p)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
@@ -3979,10 +4458,10 @@ int main(int argc, char** argv) {
         if (rounds > 0 && !drive.d.usage.empty())
             std::printf("%-24s %lld experts swapped into the VRAM tier (every %d rounds, %.3f ms/round)\n", "adaptive tier",
                         (long long) swaps_total, o.adapt_every, ms_adapt / rounds);
-        if (rounds > 0 && drive.d.pcie_num > 0)
-            std::printf("%-24s %.2f distinct experts per layer read over PCIe (share %d/256 of the misses)\n",
+        if (rounds > 0 && drive.d.pcie_num.front() + drive.d.pcie_num.back() > 0)
+            std::printf("%-24s %.2f distinct experts per layer read over PCIe (share %d/256 to %d/256 of the misses)\n",
                         "pcie experts", (double) (drive.d.pcie_experts - pcie0) / (double) (rounds * g.n_layers),
-                        drive.d.pcie_num);
+                        drive.d.pcie_num.front(), drive.d.pcie_num.back());
         (void) pool_ms0;
         if (use_mtp && rounds > 0)
             std::printf("%-24s %.3f ms/round drafting (%lld rounds), MTP prompt %.1f ms, %.0f MiB of VRAM\n", "mtp",
@@ -4029,7 +4508,7 @@ int main(int argc, char** argv) {
                     prefill_ms > 0 ? 1000.0 * (double) (n_prompt - 1) / prefill_ms : 0.0, ttft_ms);
     if (!o.dump_mixed.empty()) {
         std::vector<float> mx((size_t) g.n_embd);
-        if (cudaMemcpy(mx.data(), ss.block.mixed, mx.size() * sizeof(float), cudaMemcpyDeviceToHost) !=
+        if (cudaMemcpy(mx.data(), ss.stages[0].block.mixed, mx.size() * sizeof(float), cudaMemcpyDeviceToHost) !=
             cudaSuccess) {
             std::fprintf(stderr, "strata generate: reading mixed back failed\n");
             return 1;
@@ -4050,7 +4529,7 @@ int main(int argc, char** argv) {
     // ---- the residual, for bisecting the head against the layers (see `dump_residual`'s note)
     if (!o.dump_residual.empty()) {
         std::vector<float> R((size_t) g.hc * g.n_embd);
-        if (cudaMemcpy(R.data(), ss.R, R.size() * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
+        if (cudaMemcpy(R.data(), ss.stages[0].block.R, R.size() * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
             std::fprintf(stderr, "strata generate: reading R back failed\n");
             return 1;
         }
@@ -4165,7 +4644,7 @@ int main(int argc, char** argv) {
     cudaFree(d_logits);
     cudaFree(d_emb);
     cudaFree(d_parts);
-    cudaFree(sbuf);
-    cudaFree(arena);
+    for (void* p : sbufs) cudaFree(p);
+    for (void* p : arenas) cudaFree(p);
     return 0;
 }

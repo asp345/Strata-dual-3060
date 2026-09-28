@@ -70,7 +70,7 @@ int main() {
         s[(size_t) kLayer] = 2.0f;
     }
     std::string err;
-    if (!k::cvec_upload(dir, s, /*project*/ 0, 4, 44, N, HC, err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 2; }
+    if (!k::cvec_upload(dir, s, /*project*/ 0, 4, 44, N, HC, {0}, err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 2; }
     check(k::cvec().covers(kLayer) && !k::cvec().covers(kOff) && !k::cvec().covers(45), "covers(): steered layers only");
 
     std::vector<float> R((size_t) (T * D)), bo((size_t) (T * N)), inj((size_t) (T * HC));
@@ -113,7 +113,7 @@ int main() {
     }
     // s = 1 removes it
     s[(size_t) kLayer] = 1.0f;
-    if (!k::cvec_upload(dir, s, 0, 4, 44, N, HC, err)) return 2;
+    if (!k::cvec_upload(dir, s, 0, 4, 44, N, HC, {0}, err)) return 2;
     up(dR, R);
     k::cvec_apply(dR, kLayer, T, D, nullptr, 0, nullptr, 0, false, nullptr);
     ck(cudaDeviceSynchronize(), "project s=1");
@@ -202,7 +202,7 @@ int main() {
     std::printf("add\n");
     for (int64_t j = 0; j < N; ++j) dir[(size_t) (kLayer * N + j)] *= 0.1f;   // d = 0.1 v, s = 1
     s[(size_t) kLayer] = 1.0f;
-    if (!k::cvec_upload(dir, s, /*add*/ 1, 4, 44, N, HC, err)) return 2;
+    if (!k::cvec_upload(dir, s, /*add*/ 1, 4, 44, N, HC, {0}, err)) return 2;
     up(dR, R);
     k::cvec_apply(dR, kLayer, T, D, nullptr, 0, nullptr, 0, false, nullptr);
     ck(cudaDeviceSynchronize(), "add");

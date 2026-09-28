@@ -129,7 +129,7 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
                         f" ({time.time() - t0:.0f} s so far)")
                 elif "expert cache " in line and " slots, " in line and "auto" not in line:
                     n = line.split("expert cache ", 1)[1].split(";")[0].replace(" slots,", " experts,").strip()
-                    say("cache", f"[strata] filling the GPU's expert cache ({n}) ...")
+                    say("cache " + n, f"[strata] filling the GPU's expert cache ({n}) ...")
                 elif "session is up" in line:
                     say("up", "[strata] almost ready ...")
         if time.time() - last > heartbeat:
@@ -460,8 +460,11 @@ def child_env(cfg: dict) -> dict:
     """The engine's environment: the CUDA libraries setup installed (pip's nvidia packages, or the toolkit that
     compiled it) first on the library search path."""
     env = dict(os.environ)
-    if cfg.get("gpu") is not None:                   # issue #51: the GPU to run on, numbered as nvidia-smi does; CUDA's
-        env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"      # own default order (fastest first) can number the cards otherwise
+    if cfg.get("gpu") is not None or "--gpus" in (cfg.get("args") or []):
+        # issue #51: the GPU(s) to run on, numbered as nvidia-smi does; CUDA's own default order (fastest first) can
+        # number the cards otherwise
+        env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    if cfg.get("gpu") is not None:
         env["CUDA_VISIBLE_DEVICES"] = str(cfg["gpu"])
     dirs = [d for d in cfg.get("lib_dirs") or [] if Path(d).is_dir()]
     if dirs:
@@ -574,6 +577,9 @@ class Service:
             from serve.telemetry import Telemetry
             self.telemetry = Telemetry(extra=lambda: {"tok_s": self._tok_s()},
                                        gpu_index=int(getattr(self, "gpu_index", 0) or 0))
+            gpus = (getattr(self.engine, "info", {}) or {}).get("gpus")
+            if gpus:
+                self.telemetry.use_gpus(str(gpus).split(","))
 
     def _tok_s(self):
         with self.status_lock:

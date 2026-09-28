@@ -293,6 +293,15 @@ __global__ void __launch_bounds__(THREADS) gr_up_multi_kernel(GrMulti m) {
     }
 }
 
+__global__ void gr_write_fused_kernel(float* __restrict__ R, const float* __restrict__ bo,
+                                     const float* __restrict__ inj, int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const int64_t t = i / D;
+    const int j = (int) (i - t * D), c = j / N, d = j - c * N;
+    R[i] = fmaf(bo[t * N + d], 2.0f * sigmoidf_(inj[t * HC + c] / (float) HC), R[i]);
+}
+
 }  // namespace
 
 void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream) {
@@ -315,11 +324,13 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
     m.T = n_tok;
     cudaStream_t st = (cudaStream_t) stream;
     gr_norm_multi_kernel<<<n_tok, THREADS, 0, st>>>(m);
-    static bool attr = false;
-    if (!attr) {
+    static uint64_t attr_devices = 0;   // a function attribute is per device
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (!((attr_devices >> dev) & 1u)) {
         cudaFuncSetAttribute(gr_down_multi_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                              (int) (kFusedGrMaxT * TILE * sizeof(float)));
-        attr = true;
+        attr_devices |= 1ull << dev;
     }
     gr_down_multi_kernel<<<DOWN_BLOCKS + 1, THREADS, (size_t) n_tok * TILE * sizeof(float), st>>>(m);
     gr_up_multi_kernel<<<UPM_BLOCKS, THREADS, 0, st>>>(m);
@@ -347,6 +358,16 @@ void fused_gr_read(const FusedGrArgs& a, void* stream) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "fused_gr_read: %s\n", cudaGetErrorString(e));
+        std::exit(1);
+    }
+}
+
+void fused_gr_write(float* R, const float* bo, const float* inj, int n_tok, void* stream) {
+    const int64_t n = (int64_t) n_tok * D;
+    gr_write_fused_kernel<<<(unsigned) ((n + THREADS - 1) / THREADS), THREADS, 0, (cudaStream_t) stream>>>(R, bo, inj, n);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "fused_gr_write: %s\n", cudaGetErrorString(e));
         std::exit(1);
     }
 }
