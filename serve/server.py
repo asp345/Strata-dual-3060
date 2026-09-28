@@ -571,6 +571,15 @@ class Service:
                     req["output_config"] = {"effort": effort}
         return req
 
+    def model_card(self) -> dict:
+        """GET /v1/models' entry, with OpenRouter's `reasoning` object: the efforts a request may ask for, and what a
+        request that names none gets (the shared Chat setting, else thinking at the highest level)."""
+        shared = self.shared.get("reasoning_effort")
+        return {"id": self.model, "object": "model",
+                "reasoning": {"mandatory": False, "default_enabled": shared != "none",
+                              "supported_efforts": list(REASONING_EFFORTS),
+                              "default_effort": shared if shared and shared != "none" else "high"}}
+
     def start_telemetry(self):
         """The hardware sampler behind GET /metrics (serve/telemetry.py), recording this server's tok/s too."""
         if getattr(self, "telemetry", None) is None:
@@ -1177,7 +1186,7 @@ def make_handler(svc: Service):
                 self._json(200, s)
             elif path == "/v1/models":
                 if self._authorized():
-                    self._json(200, {"object": "list", "data": [{"id": svc.model, "object": "model"}]})
+                    self._json(200, {"object": "list", "data": [svc.model_card()]})
             else:
                 self._json(404, {"error": {"message": "not found"}})
 
@@ -1360,6 +1369,7 @@ def serve(svc: Service, host="127.0.0.1", port=8095) -> ThreadingHTTPServer:
 
 
 SHARED_KEYS = ("reasoning_effort", "temperature", "top_p", "top_k", "seed", "max_tokens", "experimental_speed_projection")
+REASONING_EFFORTS = ("high", "medium", "low", "none")    # "high" is the template's xhigh (frontend.EFFORT)
 
 
 def clean_shared_defaults(d) -> dict:
@@ -1374,7 +1384,7 @@ def clean_shared_defaults(d) -> dict:
             continue
         number = isinstance(value, (int, float)) and not isinstance(value, bool)
         if key == "reasoning_effort":
-            if value not in ("none", "low", "medium", "high"):
+            if value not in REASONING_EFFORTS:
                 raise ValueError("reasoning_effort: none, low, medium or high")
         elif key == "temperature":
             if not number or not 0 <= value <= 2:
