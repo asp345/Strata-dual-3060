@@ -1172,11 +1172,15 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         const strata::kernels::QsaAttnPools pools = staged ? pools_of(m.stage_pool, m.ident_table)
                                                                            : core::qsa_attn_pools(st);
                         pt.mark(kPfQsaAttn, cs);
-                        for (int64_t t0 = 0; t0 < T; t0 += m.attn_batch) {
-                            const int64_t nb = std::min(m.attn_batch, T - t0);
-                            strata::kernels::qsa_decode_attn_batch(m.q + t0 * ZV, pools, m.sel_ids + t0 * m.cap,
-                                                                   m.steps_dev + t0 * strata::kernels::kStepCount, m.cap, s,
-                                                                   m.attn_scratch, m.attn + t0 * ZV, nb, m.cs);
+                        if (strata::kernels::qsa_prefill_attn_supported(pools, s)) {
+                            strata::kernels::qsa_prefill_attn(m.q, pools, m.sel_ids, m.steps_dev, m.cap, s, m.attn, T, m.cs);
+                        } else {   // q4_0 KV: the decode window's kernel, attn_batch queries at a time
+                            for (int64_t t0 = 0; t0 < T; t0 += m.attn_batch) {
+                                const int64_t nb = std::min(m.attn_batch, T - t0);
+                                strata::kernels::qsa_decode_attn_batch(m.q + t0 * ZV, pools, m.sel_ids + t0 * m.cap,
+                                                                       m.steps_dev + t0 * strata::kernels::kStepCount, m.cap,
+                                                                       s, m.attn_scratch, m.attn + t0 * ZV, nb, m.cs);
+                            }
                         }
                         if (st.kv_q4) strata::kernels::fwht256_inplace_cuda(m.attn, T * 24, m.cs);
                         pt.mark(kPfQsa, cs);

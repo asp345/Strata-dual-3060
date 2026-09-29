@@ -43,4 +43,11 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
 void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
                            int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream);
 
+/// The prompt path's QSA attention: n_q queries, each with its own selection (ids: cap per query; steps: its width),
+/// on the tensor cores (fp16 operands, fp32 accumulation, an online softmax per (query, KV head)).  Same layout and
+/// result as qsa_decode_attn_batch to fp16 rounding; needs no scratch.  fp16 or int8 KV (not q4_0).
+bool qsa_prefill_attn_supported(const QsaAttnPools& pools, const QsaShapes& s);
+void qsa_prefill_attn(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
+                      const QsaShapes& s, float* attn, int64_t n_q, void* stream);
+
 }  // namespace strata::kernels
