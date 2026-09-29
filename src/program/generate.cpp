@@ -90,6 +90,21 @@
 
 namespace {
 
+// The next verify window's PLE rows read ahead into the reader's cache while its drafts are made: its first token
+// before the chain starts, each draft as the chain makes it (the window then collects them as cache hits).  `prev`
+// starts as the session's committed history.
+struct PleAhead {
+    const strata::core::PleRun& ple;
+    int32_t prev[2];
+    void operator()(int32_t tok) {
+        uint32_t rows[strata::kernels::PLE_N_HEADS];
+        strata::kernels::ngram_rows(&tok, prev, 1, ple.consts, rows);
+        ple.table->prefetch(rows, 1);
+        prev[0] = prev[1];
+        prev[1] = tok;
+    }
+};
+
 using Clock = std::chrono::steady_clock;
 
 struct Options {
@@ -3714,8 +3729,11 @@ int main(int argc, char** argv) {
                 }
                 std::fflush(stdout);
                 ++rounds;
+                PleAhead ahead{ss.ple, {ss.ple_prev[0], ss.ple_prev[1]}};
+                if (ss.ple.ready() && !eos) ahead(outv[(size_t) a]);
                 bool drafted = eos || produced_n >= max_new ||
-                               mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p);
+                               mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p,
+                                         nullptr, ss.ple.ready() ? std::function<void(int32_t)>(std::ref(ahead)) : nullptr);
                 if (drafted) drafted = ver.commit_wait(err);
                 if (adapt_thr.joinable()) adapt_thr.join();
                 if (!adapt_ok) {
@@ -4413,8 +4431,11 @@ int main(int argc, char** argv) {
                 total_ms += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
                 break;
             }
+            PleAhead ahead{ss.ple, {ss.ple_prev[0], ss.ple_prev[1]}};
+            if (ss.ple.ready() && use_mtp) ahead(outv[(size_t) a]);
             bool drafted = !use_mtp || (int64_t) produced.size() >= o.max_new ||
-                           mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) o.spec_min_p);
+                           mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) o.spec_min_p,
+                                     nullptr, ss.ple.ready() ? std::function<void(int32_t)>(std::ref(ahead)) : nullptr);
             if (drafted) drafted = ver.commit_wait(err);
             if (adapt_thr.joinable()) adapt_thr.join();
             if (!adapt_ok) return 1;

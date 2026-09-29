@@ -722,7 +722,7 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
 }
 
 bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
-                       float* probs, float min_p, int* n_drafts) {
+                       float* probs, float min_p, int* n_drafts, const std::function<void(int32_t)>& on_draft) {
     if (T < 1 || T > max_t_ || a < 0 || a >= T) { err = "mtp: draft arguments out of range"; return false; }
     DeviceGuard dg(device_);
     if (!capture_round(T, err)) return false;
@@ -748,6 +748,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         return false;
     }
     drafts[0] = ((volatile int32_t*) h_out_)[0];
+    if (on_draft) on_draft(drafts[0]);
     float pj = ((volatile float*) h_prob_)[0];
     if (probs) probs[0] = pj;
     int n = 1;
@@ -761,6 +762,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
             return false;
         }
         drafts[j] = ((volatile int32_t*) h_out_)[j];
+        if (on_draft) on_draft(drafts[j]);
         pj = ((volatile float*) h_prob_)[j];
         if (probs) probs[j] = pj;
         ++n;
