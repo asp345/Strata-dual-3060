@@ -839,6 +839,25 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         std::string ple_next_err;
         std::future<bool> ple_next;             // declared after everything it reads: an early return waits for it
         int ple_buf = 0;
+        auto ple_start = [&](int64_t c, int b) {
+            ple_next = std::async(std::launch::async, [&ple_gather, &ple_next_err, c, b] { return ple_gather(c, b, ple_next_err); });
+        };
+        // a chunk's PLE rows are read on a thread from the chunk before (the first chunk's from the start, behind its
+        // embedding and layer 0); layer 1 takes them: the upload, then the next chunk's read
+        auto ple_take = [&](int64_t c0, int64_t T, std::string& err) -> bool {
+            const auto tp = Clock::now();
+            if (!ple_next.get()) { err = ple_next_err; return false; }
+            cudaMemcpyAsync(m.ple_emb, m.ple_emb_host[ple_buf], (size_t) T * N * 4, cudaMemcpyHostToDevice, m.cs);
+            cudaEventRecord(m.ple_copied[ple_buf], m.cs);
+            if (c0 + m.T < n) {
+                cudaEventSynchronize(m.ple_copied[ple_buf ^ 1]);   // the other buffer's upload (a chunk ago) is done
+                ple_start(c0 + m.T, ple_buf ^ 1);
+            }
+            ple_buf ^= 1;
+            pst.ms_ple += ms_since(tp);
+            return true;
+        };
+        if (ple_on && &m == &mp && n > 0) ple_start(0, 0);
         bool hold = false;
         for (int64_t k = 0, c0 = 0; c0 < n; ++k, c0 += m0.T) {
             const int64_t T = std::min(m0.T, n - c0), p0 = pos0 + c0;
@@ -908,26 +927,6 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 cudaEventRecord(m.handed, cs);
                 signal(handed, pi, k + 1);
             }
-            // ---- the PLE rows of the whole chunk, one batched SSD request (read ahead on a thread, see ple_gather)
-            if (ple_on && &m == &mp) {
-                const auto tp = Clock::now();
-                if (!ple_next.valid()) {
-                    if (!ple_gather(c0, ple_buf, err)) return false;
-                } else if (!ple_next.get()) {
-                    err = ple_next_err;
-                    return false;
-                }
-                cudaMemcpyAsync(m.ple_emb, m.ple_emb_host[ple_buf], (size_t) T * N * 4, cudaMemcpyHostToDevice, m.cs);
-                cudaEventRecord(m.ple_copied[ple_buf], m.cs);
-                if (c0 + m.T < n) {
-                    cudaEventSynchronize(m.ple_copied[ple_buf ^ 1]);   // the other buffer's upload (a chunk ago) is done
-                    ple_next = std::async(std::launch::async, [&ple_gather, &ple_next_err, c1 = c0 + m.T, b = ple_buf ^ 1] {
-                        return ple_gather(c1, b, ple_next_err);
-                    });
-                }
-                ple_buf ^= 1;
-                pst.ms_ple += ms_since(tp);
-            }
             // ---- the QSA step records of every position in the chunk
             for (int64_t t = 0; t < T; ++t) strata::kernels::qsa_step_fill(m.steps_host.data() + t * strata::kernels::kStepCount, p0 + t, s);
             cudaMemcpyAsync(m.steps_dev, m.steps_host.data(), (size_t) T * strata::kernels::kStepCount * 4,
@@ -989,11 +988,12 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     ++issued;
                 }
             };
-            if (stream_all) issue_until((size_t) m.ring);   // the stage's first experts, behind the embedding and the PLE
+            if (stream_all) issue_until((size_t) m.ring);   // the stage's first experts, behind the embedding
             for (int64_t l = m.l0; l < m.l1; ++l) {
                 core::progress_beat();   // the serve watchdog: a prompt chunk of 8192 tokens is still moving
                 const core::LayerView v(*m.wt, l);
                 // ---- the PLE block at layer 1, token by token (its conv reads the previous tokens' rows)
+                if (l == 1 && ple_on && !ple_take(c0, T, err)) return false;
                 if (l == 1 && ple_on && ple_batch) {
                     // the whole chunk at once, in sub-batches carved from the idle scratch region: the key and value
                     // projections as GEMMs (a token at a time they re-read ~52 MB of BF16 key per token on the IQ
