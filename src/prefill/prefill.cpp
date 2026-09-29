@@ -19,6 +19,7 @@
 #include "strata/core/native_head.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
+#include "strata/kernels/qsa_prompt_attn.hpp"
 #include "strata/kernels/qsa_select.hpp"
 #include "strata/prefill/gemm.hpp"
 #include "strata/prefill/moe_mmq.hpp"
@@ -1212,9 +1213,9 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         const strata::kernels::QsaAttnPools pools = staged ? pools_of(m.stage_pool, m.ident_table)
                                                                            : core::qsa_attn_pools(st);
                         pt.mark(kPfQsaAttn, cs);
-                        if (strata::kernels::qsa_prefill_attn_supported(pools, s)) {
-                            strata::kernels::qsa_prefill_attn(m.q, pools, m.sel_ids, m.steps_dev, m.cap, s, m.attn, T, m.cs);
-                        } else {   // q4_0 KV: the decode window's kernel, attn_batch queries at a time
+                        // the chunk on tensor cores (qsa_prompt_attn.hpp); Q4_0 KV or a pre-sm_80 card: the decode window's
+                        // kernel, attn_batch queries at a time
+                        if (!strata::kernels::qsa_prompt_attn_batch(m.q, pools, m.sel_ids, m.steps_dev, m.cap, s, m.attn, T, m.cs)) {
                             for (int64_t t0 = 0; t0 < T; t0 += m.attn_batch) {
                                 const int64_t nb = std::min(m.attn_batch, T - t0);
                                 strata::kernels::qsa_decode_attn_batch(m.q + t0 * ZV, pools, m.sel_ids + t0 * m.cap,
