@@ -263,7 +263,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         P.ple_ = b.take<float>(T * N); P.emb_ = b.take<float>(T * N); P.R_ = b.take<float>(T * HC * N);
         P.mixed_ = b.take<float>(T * N); P.bo_ = b.take<float>(T * N);
         P.inj_ = b.take<float>(T * HC); P.inj2_ = b.take<float>(T * HC);
-        P.lo_ = b.take<float>(T * (uint64_t) g.hc_lr); P.rs_ = b.take<float>(T * HC); P.xn_ = b.take<float>(T * HC * N);
+        P.lo_ = b.take<float>(T * (uint64_t) g.hc_lr); P.rs_ = b.take<float>(T * HC); P.xn_ = b.take<float>(strata::kernels::fused_gr_multi_scratch_floats((int) T));
         P.xq_ = b.take<uint8_t>(strata::kernels::native_q8_1_bytes(max_in, (int) T));
         P.qkv_L_ = b.take<float>(pG * T * C); P.h_L_ = b.take<float>(pG * T * C);
         P.gate_L_ = b.take<float>(pG * T * HV); P.beta_L_ = b.take<float>(pG * T * HV);

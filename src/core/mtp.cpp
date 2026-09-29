@@ -209,7 +209,7 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         hn_ = b.take<float>(T * HC * N); h2_ = b.take<float>(T * HC * N);
         mixed_ = b.take<float>(T * N); inj_ = b.take<float>(T * HC); inj2_ = b.take<float>(T * HC);
         lo_ = b.take<float>(T * (uint64_t) g.hc_lr); rs_ = b.take<float>(T * HC); bo_ = b.take<float>(T * N);
-        xn_ = b.take<float>(T * HC * N);
+        xn_ = b.take<float>(strata::kernels::fused_gr_multi_scratch_floats((int) T));
         xq_ = b.take<uint8_t>(strata::kernels::native_q8_1_bytes((int) (NH * HD), 8));
         qfull_ = b.take<float>(T * NH * 2 * HD); qcur_ = b.take<float>(T * NH * HD);
         kcur_ = b.take<float>(T * NKV * HD); vcur_ = b.take<float>(T * NKV * HD);

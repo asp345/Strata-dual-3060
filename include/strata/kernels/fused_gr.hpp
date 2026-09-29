@@ -17,6 +17,7 @@
 // must be different buffers (every block reads the former while one block writes the latter).
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 namespace strata::kernels {
@@ -43,9 +44,11 @@ void fused_gr_read(const FusedGrArgs& a, void* stream);
 
 /// Plan v0.3 P6: the same read for up to 8 tokens that share the weights (a verify window): the weights are read
 /// once for all of them.  `a[t]` is token t's arguments (its own R, pending write, lo, rs, inject, mixed; the four
-/// weight pointers and eps must be the same for every t); `xn_scratch` is n_tok * hc * n_embd floats.  Every
-/// token's outputs are bitwise `fused_gr_read(a[t])`.
+/// weight pointers and eps must be the same for every t); `xn_scratch` holds fused_gr_multi_scratch_floats(n_tok)
+/// floats.  A token's outputs do not depend on n_tok; they round differently from `fused_gr_read` (the down
+/// projection is summed over four quarters of its inputs).
 constexpr int kFusedGrMaxT = 8;
+size_t fused_gr_multi_scratch_floats(int n_tok);
 void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream);
 /// The folded write alone, `R <- R + bo * 2 sigmoid(inj / hc)` with the arithmetic `fused_gr_read` applies it with,
 /// for `n_tok` tokens (R hc * n_embd, bo n_embd, inj hc per token): a pipeline stage's last layer, whose write has no
