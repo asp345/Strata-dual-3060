@@ -48,9 +48,13 @@ void swiglu_interleaved(const float* gu, uint16_t* h16, int64_t n, void* stream)
 void swiglu_pair(const float* g, const float* u, uint16_t* h16, int64_t n, void* stream);
 /// Gather rows: dst16[i, :] = x16[src[i], :] (n rows of `width` BF16).
 void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int64_t n, int64_t width, void* stream);
-/// bo[t, :] = shared[t, :] * sigmoid(sg[t]) + sum_k w[t, k] * D[slot[t, k], :]
+/// bo[t, :] = (a + b) + shared[t, :] * sigmoid(sg[t]): a = sum_k w[t, k] * D[slot[t, k], :] over the pairs with
+/// slot < split, b the same over the pairs with slot >= split (in k order, each), or `part` when not null (b computed
+/// by moe_partial on another GPU).
 void moe_combine(const float* D, const int32_t* slot, const float* w, const float* shared, const float* sg, float* bo,
-                 int64_t T, void* stream);
+                 int64_t T, int64_t split, const float* part, void* stream);
+/// part[t, :] = moe_combine's b, from D holding only the rows from `split` on (row slot - split).
+void moe_partial(const float* D, const int32_t* slot, const float* w, float* part, int64_t T, int64_t split, void* stream);
 
 // ---- QSA helpers
 /// In place: x[r, :] = x[r, :] * rsqrt(mean x^2 + eps) * w  over rows of `cols` (row stride `ld`).

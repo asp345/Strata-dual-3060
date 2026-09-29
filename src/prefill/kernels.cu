@@ -338,14 +338,33 @@ __global__ void gather_rows16_kernel(const uint16_t* __restrict__ x, const int32
 }
 __global__ void moe_combine_kernel(const float* __restrict__ Dm, const int32_t* __restrict__ slot,
                                    const float* __restrict__ w, const float* __restrict__ shared,
-                                   const float* __restrict__ sg, float* __restrict__ bo, int64_t T) {
+                                   const float* __restrict__ sg, float* __restrict__ bo, int64_t T, int64_t split,
+                                   const float* __restrict__ part) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= T * N) return;
     const int64_t t = i / N, d = i % N;
-    float s = 0.0f;
+    float a = 0.0f, b = 0.0f;
 #pragma unroll
-    for (int k = 0; k < 10; ++k) s = fmaf(w[t * 10 + k], Dm[(int64_t) slot[t * 10 + k] * N + d], s);
-    bo[i] = s + shared[i] * sigm(sg[t]);
+    for (int k = 0; k < 10; ++k) {
+        const int64_t sl = slot[t * 10 + k];
+        if (sl < split) a = fmaf(w[t * 10 + k], Dm[sl * N + d], a);
+        else if (part == nullptr) b = fmaf(w[t * 10 + k], Dm[sl * N + d], b);
+    }
+    if (part != nullptr) b = part[i];
+    bo[i] = (a + b) + shared[i] * sigm(sg[t]);
+}
+__global__ void moe_partial_kernel(const float* __restrict__ Dm, const int32_t* __restrict__ slot,
+                                   const float* __restrict__ w, float* __restrict__ part, int64_t T, int64_t split) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= T * N) return;
+    const int64_t t = i / N, d = i % N;
+    float b = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 10; ++k) {
+        const int64_t sl = slot[t * 10 + k];
+        if (sl >= split) b = fmaf(w[t * 10 + k], Dm[(sl - split) * N + d], b);
+    }
+    part[i] = b;
 }
 
 // ---------------------------------------------------------------- QSA helpers
@@ -544,9 +563,13 @@ void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int
     check("gather_rows16");
 }
 void moe_combine(const float* Dm, const int32_t* slot, const float* w, const float* shared, const float* sg, float* bo,
-                 int64_t T, void* stream) {
-    moe_combine_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(Dm, slot, w, shared, sg, bo, T);
+                 int64_t T, int64_t split, const float* part, void* stream) {
+    moe_combine_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(Dm, slot, w, shared, sg, bo, T, split, part);
     check("moe_combine");
+}
+void moe_partial(const float* Dm, const int32_t* slot, const float* w, float* part, int64_t T, int64_t split, void* stream) {
+    moe_partial_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(Dm, slot, w, part, T, split);
+    check("moe_partial");
 }
 void rms_rows(float* x, const float* w, int64_t rows, int64_t cols, int64_t ld, float eps, void* stream) {
     if (rows <= 0) return;
