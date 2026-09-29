@@ -95,6 +95,8 @@ private:
     uint64_t vram_ = 0;
     cudaStream_t cs_ = nullptr;
     cudaGraphExec_t prefill_exec_[9] = {};
+    int32_t* pf_dev_ = nullptr;   ///< a prompt's rows' token / step / position records, uploaded at once
+    int64_t pf_cap_ = 0;          ///< its capacity in ints
     cudaGraphExec_t round_exec_[9] = {};
 
     struct Tensor { std::string name, kind; int64_t rows = 0, cols = 0; uint64_t off = 0, bytes = 0; };
