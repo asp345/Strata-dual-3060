@@ -145,60 +145,76 @@ __global__ void gdn_l2_kernel(float* __restrict__ h, float eps) {
     const float ss = part[0] + part[1] + part[2] + part[3];
     x[threadIdx.x] = v * rsqrtf(ss + eps);
 }
-constexpr int RG = 4, RPG = S / RG;
-__global__ void __launch_bounds__(S * RG) gdn_rec_kernel(float* __restrict__ state, const float* __restrict__ h,
-                                                         const float* __restrict__ gate,
-                                                         const float* __restrict__ beta, const float* __restrict__ z,
-                                                         const float* __restrict__ gamma, float eps,
-                                                         float* __restrict__ y, uint16_t* __restrict__ y16, int64_t T) {
-    __shared__ float sk[S], sq[S], red[RG][S], wsum[16];
-    const int head = blockIdx.x, col = threadIdx.x, rg = threadIdx.y, tid = rg * S + col;
+// The recurrence with one thread per state column holding all S rows of it: a column's update needs only its own
+// rows, so no cross-thread reduction or barrier sits between two tokens except the one that publishes the next
+// token's q and k (double-buffered).  The output's RMS norm and gate need every column of a token, so this writes the
+// raw output (o / sqrt(S)) into y and gdn_out_kernel finishes it for all tokens at once.
+__global__ void __launch_bounds__(S) gdn_rec_kernel(float* __restrict__ state, const float* __restrict__ h,
+                                                     const float* __restrict__ gate, const float* __restrict__ beta,
+                                                     float* __restrict__ y, int64_t T) {
+    __shared__ __align__(16) float qk[2][2][S];      // [buffer][q, k][row]
+    const int head = blockIdx.x, col = threadIdx.x;
     const int qh = head % HK;
-    float s[RPG];
-    float* base = state + ((size_t) (rg * RPG) * HV + head) * S + col;
-    const size_t rs = (size_t) HV * S;
+    float s[S];
 #pragma unroll
-    for (int r = 0; r < RPG; ++r) s[r] = base[r * rs];
-    const float g_col = gamma[col];
+    for (int r = 0; r < S; ++r) s[r] = state[((size_t) r * HV + head) * S + col];
+    float gn = 0.0f, btn = 0.0f, vn = 0.0f;               // the next token's gate, beta and value, loaded a token early
+    if (T > 0) {
+        qk[0][0][col] = h[qh * S + col];
+        qk[0][1][col] = h[HK * S + qh * S + col];
+        gn = gate[head];
+        btn = beta[head];
+        vn = h[2 * HK * S + head * S + col];
+    }
     for (int64_t t = 0; t < T; ++t) {
-        const float* ht = h + t * C;
-        __syncthreads();
-        if (tid < S) { sq[tid] = ht[qh * S + tid]; sk[tid] = ht[HK * S + qh * S + tid]; }
-        __syncthreads();
-        const float g = __expf(gate[t * HV + head]);
-        float kv = 0.0f;
+        const int b = (int) (t & 1);
+        const float g = __expf(gn), bt = btn, v = vn;
+        __syncthreads();                                 // token t's q, k are in; buffer b ^ 1 is free
+        if (t + 1 < T) {
+            const float* hn = h + (t + 1) * C;
+            qk[b ^ 1][0][col] = hn[qh * S + col];
+            qk[b ^ 1][1][col] = hn[HK * S + qh * S + col];
+            gn = gate[(t + 1) * HV + head];
+            btn = beta[(t + 1) * HV + head];
+            vn = hn[2 * HK * S + head * S + col];
+        }
+        float kv0 = 0.0f, kv1 = 0.0f, kv2 = 0.0f, kv3 = 0.0f;
 #pragma unroll
-        for (int r = 0; r < RPG; ++r) kv = fmaf(s[r], sk[rg * RPG + r], kv);
-        red[rg][col] = kv;
-        __syncthreads();
-        const float kv_col = red[0][col] + red[1][col] + red[2][col] + red[3][col];
-        const float delta = (ht[2 * HK * S + head * S + col] - g * kv_col) * beta[t * HV + head];
-        float o = 0.0f;
+        for (int r = 0; r < S; r += 4) {
+            const float4 k4 = *reinterpret_cast<const float4*>(&qk[b][1][r]);
+            kv0 = fmaf(s[r], k4.x, kv0); kv1 = fmaf(s[r + 1], k4.y, kv1);
+            kv2 = fmaf(s[r + 2], k4.z, kv2); kv3 = fmaf(s[r + 3], k4.w, kv3);
+        }
+        const float delta = (v - g * ((kv0 + kv1) + (kv2 + kv3))) * bt;
+        float o0 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f;
 #pragma unroll
-        for (int r = 0; r < RPG; ++r) {
-            s[r] = fmaf(g, s[r], sk[rg * RPG + r] * delta);
-            o = fmaf(s[r], sq[rg * RPG + r], o);
+        for (int r = 0; r < S; r += 4) {
+            const float4 k4 = *reinterpret_cast<const float4*>(&qk[b][1][r]);
+            const float4 q4 = *reinterpret_cast<const float4*>(&qk[b][0][r]);
+            s[r] = fmaf(g, s[r], k4.x * delta);         o0 = fmaf(s[r], q4.x, o0);
+            s[r + 1] = fmaf(g, s[r + 1], k4.y * delta); o1 = fmaf(s[r + 1], q4.y, o1);
+            s[r + 2] = fmaf(g, s[r + 2], k4.z * delta); o2 = fmaf(s[r + 2], q4.z, o2);
+            s[r + 3] = fmaf(g, s[r + 3], k4.w * delta); o3 = fmaf(s[r + 3], q4.w, o3);
         }
-        __syncthreads();
-        red[rg][col] = o;
-        __syncthreads();
-        float oc = 0.0f, sp = 0.0f;
-        if (rg == 0) {
-            oc = (red[0][col] + red[1][col] + red[2][col] + red[3][col]) * rsqrtf((float) S);
-            sp = oc * oc;
-        }
-        sp = warp_sum(sp);
-        if ((tid & 31) == 0) wsum[tid >> 5] = sp;
-        __syncthreads();
-        if (rg == 0) {
-            const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
-            const float v = oc * rsqrtf(ss / (float) S + eps) * g_col * sigm(z[t * HV * S + head * S + col]);
-            y[t * HV * S + head * S + col] = v;
-            y16[t * HV * S + head * S + col] = hf(v);
-        }
+        y[t * HV * S + head * S + col] = ((o0 + o1) + (o2 + o3)) * rsqrtf((float) S);
     }
 #pragma unroll
-    for (int r = 0; r < RPG; ++r) base[r * rs] = s[r];
+    for (int r = 0; r < S; ++r) state[((size_t) r * HV + head) * S + col] = s[r];
+}
+
+// block (token, head): y (the raw output) through the RMS norm over the head's S columns, gamma and the z gate
+__global__ void __launch_bounds__(S) gdn_out_kernel(const float* __restrict__ z, const float* __restrict__ gamma,
+                                                    float eps, float* __restrict__ y, uint16_t* __restrict__ y16) {
+    __shared__ float wsum[S / 32];
+    const size_t i = (size_t) blockIdx.x * S + threadIdx.x;   // blockIdx.x = t * HV + head
+    const float oc = y[i];
+    const float sp = warp_sum(oc * oc);
+    if ((threadIdx.x & 31) == 0) wsum[threadIdx.x >> 5] = sp;
+    __syncthreads();
+    const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
+    const float v = oc * rsqrtf(ss / (float) S + eps) * gamma[threadIdx.x] * sigm(z[i]);
+    y[i] = v;
+    y16[i] = hf(v);
 }
 
 // ---------------------------------------------------------------- MoE
@@ -454,7 +470,8 @@ void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, i
 }
 void gdn_recurrence(float* state, const float* h, const float* gate, const float* beta, const float* z,
                     const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, void* stream) {
-    gdn_rec_kernel<<<HV, dim3(S, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, z, gamma, eps, y, y16, T);
+    gdn_rec_kernel<<<HV, S, 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
+    if (T > 0) gdn_out_kernel<<<(unsigned) (T * HV), S, 0, (cudaStream_t) stream>>>(z, gamma, eps, y, y16);
     check("gdn_recurrence");
 }
 void route(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t n_expert, void* stream) {
