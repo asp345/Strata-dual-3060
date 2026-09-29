@@ -131,7 +131,7 @@ private:
         cudaGraphExec_t exec[9] = {};
         cudaGraphExec_t commit_exec = nullptr;
         void* arena = nullptr;
-        int32_t *tok_ = nullptr, *step_ = nullptr, *pos_ = nullptr, *commit_ = nullptr;
+        int32_t *tok_ = nullptr, *step_ = nullptr, *pos_ = nullptr, *commit_ = nullptr, *pos_kv_ = nullptr, *pos_iq_ = nullptr;
         float *ple_ = nullptr, *emb_ = nullptr, *R_ = nullptr, *mixed_ = nullptr, *bo_ = nullptr;
         float *inj_ = nullptr, *inj2_ = nullptr, *lo_ = nullptr, *rs_ = nullptr, *xn_ = nullptr;
         uint8_t* xq_ = nullptr;                                   // T columns of q8_1
@@ -153,6 +153,7 @@ private:
         uint16_t* sh_bf16_ = nullptr;
         float *sh_gate_ = nullptr, *sh_up_ = nullptr, *sh_g_ = nullptr;
         float* hist_snap_ = nullptr;                              // T * NG_HIST * NG_HC_DIM
+        float *ple_key_ = nullptr, *ple_val_ = nullptr;           // the window's PLE projections, T rows each
     };
     bool capture(int T, std::string& err);
     strata::kernels::SamplerParams sampling_ = [] {
@@ -185,6 +186,8 @@ private:
     int32_t* h_tok_ = nullptr;   int32_t* m_tok_ = nullptr;     // T
     int32_t* h_step_ = nullptr;  int32_t* m_step_ = nullptr;    // T * kStepCount
     int32_t* h_pos_ = nullptr;   int32_t* m_pos_ = nullptr;     // T * n_head
+    int32_t* h_pos_kv_ = nullptr; int32_t* m_pos_kv_ = nullptr; // T * n_head_kv: a position per K row
+    int32_t* h_pos_iq_ = nullptr; int32_t* m_pos_iq_ = nullptr; // T * indexer heads: a position per indexer row
     int32_t* h_commit_ = nullptr; int32_t* m_commit_ = nullptr; // [n_keep, n_keep-1, pos_0 .. pos_{T-1}]
     float* h_ple_ = nullptr;     float* m_ple_ = nullptr;       // T * n_embd
     int32_t* h_out_ = nullptr;   int32_t* m_out_ = nullptr;     // T argmax ids

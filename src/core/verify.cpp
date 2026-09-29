@@ -128,7 +128,7 @@ Verifier::~Verifier() {
         if (P.join) cudaEventDestroy(P.join);
         if (P.arena) cudaFree(P.arena);
     }
-    void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_,
+    void* hosts[] = {h_tok_, h_step_, h_pos_, h_pos_kv_, h_pos_iq_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_,
                      h_flagA_, h_plan_, h_flagB_};
     for (void* h : hosts)
         if (h) cudaFreeHost(h);
@@ -187,6 +187,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     bool ok = mapped(T * 4, (void**) &h_tok_, (void**) &m_tok_) &&
               mapped(T * strata::kernels::kStepCount * 4, (void**) &h_step_, (void**) &m_step_) &&
               mapped(T * NH * 4, (void**) &h_pos_, (void**) &m_pos_) &&
+              mapped(T * NKV * 4 + 16, (void**) &h_pos_kv_, (void**) &m_pos_kv_) &&
+              mapped(T * IQ * 4 + 16, (void**) &h_pos_iq_, (void**) &m_pos_iq_) &&
               mapped((2 + T) * 4 + 16, (void**) &h_commit_, (void**) &m_commit_) &&
               mapped(T * N * 4, (void**) &h_ple_, (void**) &m_ple_) &&
               mapped(T * 4 + 16, (void**) &h_out_, (void**) &m_out_) &&
@@ -260,6 +262,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         const bool last = P.stage == (int) stages_.size() - 1, ple = P.l0 <= 1 && 1 < P.l1;
         P.tok_ = b.take<int32_t>(T); P.step_ = b.take<int32_t>(T * strata::kernels::kStepCount);
         P.pos_ = b.take<int32_t>(T * NH); P.commit_ = b.take<int32_t>(2 + T);
+        P.pos_kv_ = b.take<int32_t>(T * NKV); P.pos_iq_ = b.take<int32_t>(T * IQ);
         P.ple_ = b.take<float>(T * N); P.emb_ = b.take<float>(T * N); P.R_ = b.take<float>(T * HC * N);
         P.mixed_ = b.take<float>(T * N); P.bo_ = b.take<float>(T * N);
         P.inj_ = b.take<float>(T * HC); P.inj2_ = b.take<float>(T * HC);
@@ -290,6 +293,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         P.sh_up_ = b.take<float>(T * (uint64_t) g.n_ff); P.sh_g_ = b.take<float>(T + 4);
         P.head_logits_ = b.take<float>(last ? T * (uint64_t) n_vocab_ : 0);
         P.hist_snap_ = b.take<float>(ple ? T * HS : 0);
+        P.ple_key_ = b.take<float>(ple ? T * (uint64_t) strata::kernels::NG_HC_DIM : 0);
+        P.ple_val_ = b.take<float>(ple ? T * N : 0);
     };
     uint64_t total = 0;
     for (Part& P : stages_) {
@@ -372,6 +377,8 @@ bool Verifier::record_window(int T, Part& P, std::string& err) {
     if (first) copy_i32_from_mapped(P.tok_, m_tok_, T, cs);
     copy_i32_from_mapped(P.step_, m_step_, (int64_t) T * kStepCount, cs);
     copy_i32_from_mapped(P.pos_, m_pos_, (int64_t) T * NH, cs);
+    copy_i32_from_mapped(P.pos_kv_, m_pos_kv_, (int64_t) T * NKV, cs);
+    copy_i32_from_mapped(P.pos_iq_, m_pos_iq_, (int64_t) T * IQ, cs);
     if (ple_on) copy_from_mapped(P.ple_, m_ple_, (int64_t) T * N, cs);
 
     // ---- the embeddings, broadcast to the hc streams; or the residual the previous stage handed on
@@ -425,13 +432,25 @@ bool Verifier::record_window(int T, Part& P, std::string& err) {
         bool pending = l > P.l0 && !cvec().covers(l - 1);
         if (l == 1 && ple_on) {
             float* normalized = (float*) ((uint8_t*) ss.ple.scratch + ple_block_scratch_bytes());
+            // the key and value projections depend on the token's own embedding only: one pass for the group
+            const bool rows = ple_project_rows_available(ss.ple.w);
+            if (rows) {
+                try {
+                    ple_project_rows(P.ple_ + tb * N, n, ss.ple.w, P.ple_key_ + (size_t) tb * NG_HC_DIM,
+                                     P.ple_val_ + tb * N, cs);
+                } catch (const std::exception& e) {
+                    err = std::string("verify PLE: ") + e.what();
+                    return false;
+                }
+            }
             for (int t = tb; t < te; ++t) {
                 if (pending) gr_write(Rt(t), P.bo_ + t * N, P.inj2_ + t * HC, gs, Rt(t), cs);
                 PleOut po;
                 po.normalized = normalized;
                 po.result = Rt(t);
                 try {
-                    ple_block(P.ple_ + t * N, Rt(t), ss.ple.hist, ss.ple.w, po, ss.ple.scratch, cs);
+                    ple_block(P.ple_ + t * N, Rt(t), ss.ple.hist, ss.ple.w, po, ss.ple.scratch, cs,
+                              rows ? P.ple_key_ + (size_t) t * NG_HC_DIM : nullptr, rows ? P.ple_val_ + t * N : nullptr);
                     ple_history_advance(ss.ple.hist, normalized, cs);
                 } catch (const std::exception& e) {
                     err = std::string("verify PLE: ") + e.what();
@@ -511,7 +530,7 @@ bool Verifier::record_window(int T, Part& P, std::string& err) {
                 bf16_gemv_fp32_mmvf_rows(P.mixed_ + tb * N, N, (const uint16_t*) wik->data, idx_raw + tb * ID, ID, N, ID, n, cs);
                 native_mmvq(wk->native_type, wk->native_data, P.xq_, P.kcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD), n, cs);
                 native_mmvq(wv->native_type, wv->native_data, P.xq_, P.vcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD), n, cs);
-                for (int t = tb; t < te; ++t) norm_rope(P.kcur_ + t * NKV * HD, wkn, (int) NKV, (int) HD, P.pos_ + t * NH);
+                norm_rope(P.kcur_ + tb * NKV * HD, wkn, (int) (n * NKV), (int) HD, P.pos_kv_ + tb * NKV);
                 if (st.kv_q4) {   // Q4_0 KV (kv_q4.hpp): K and V rotated before they are stored
                     fwht256_inplace_cuda(P.kcur_ + tb * NKV * HD, (int64_t) n * NKV, cs);
                     fwht256_inplace_cuda(P.vcur_ + tb * NKV * HD, (int64_t) n * NKV, cs);
@@ -536,19 +555,19 @@ bool Verifier::record_window(int T, Part& P, std::string& err) {
                                               (float) qsa_freq_base(), cs);
                 native_mmvq(wq->native_type, wq->native_data, P.xq_, P.qfull_ + tb * NH * 2 * HD, (int) N, (int) (NH * 2 * HD),
                             n, cs);
-                for (int t = tb; t < te; ++t) {
-                    float* qc = P.qcur_ + t * NH * HD;
-                    if (cudaMemcpy2DAsync(qc, (size_t) HD * 4, P.qfull_ + t * NH * 2 * HD, (size_t) HD * 2 * 4,
-                                          (size_t) HD * 4, (size_t) NH, cudaMemcpyDeviceToDevice, cs) != cudaSuccess) {
+                {   // the group's q halves: one strided copy, then every head row normed and rotated at once
+                    float* qc = P.qcur_ + tb * NH * HD;
+                    if (cudaMemcpy2DAsync(qc, (size_t) HD * 4, P.qfull_ + tb * NH * 2 * HD, (size_t) HD * 2 * 4,
+                                          (size_t) HD * 4, (size_t) (n * NH), cudaMemcpyDeviceToDevice, cs) != cudaSuccess) {
                         err = "verify: the q/gate split failed";
                         return false;
                     }
-                    norm_rope(qc, wqn, (int) NH, (int) HD, P.pos_ + t * NH);
-                    if (st.kv_q4) fwht256_inplace_cuda(qc, NH, cs);   // <Hq, Hk> = <q, k>
+                    norm_rope(qc, wqn, (int) (n * NH), (int) HD, P.pos_ + tb * NH);
+                    if (st.kv_q4) fwht256_inplace_cuda(qc, n * NH, cs);   // <Hq, Hk> = <q, k>
                 }
                 bf16_gemv_fp32_mmvf_rows(P.mixed_ + tb * N, N, (const uint16_t*) wiq->data, P.qidx_ + tb * IQ * ID, IQ * ID, N,
                                          IQ * ID, n, cs);
-                for (int t = tb; t < te; ++t) norm_rope(P.qidx_ + t * IQ * ID, wiqn, (int) IQ, (int) ID, P.pos_ + t * NH);
+                norm_rope(P.qidx_ + tb * IQ * ID, wiqn, (int) (n * IQ), (int) ID, P.pos_iq_ + tb * IQ);
                 qsa_block_scores(st.idx_pooled, st.idx_dead, P.qidx_ + tb * IQ * ID, P.step_ + tb * kStepCount, n, max_blocks_,
                                  s, P.scores_ + (size_t) tb * max_blocks_, cs);
                 qsa_block_topk(P.scores_ + (size_t) tb * max_blocks_, P.step_ + tb * kStepCount, n, max_blocks_, cap_, s,
@@ -559,13 +578,12 @@ bool Verifier::record_window(int T, Part& P, std::string& err) {
                 qsa_decode_attn_batch(P.qcur_ + tb * NH * HD, pools, P.sel_ + (size_t) tb * cap_, P.step_ + tb * kStepCount, cap_,
                                       s, P.attn_scratch_ + (size_t) tb * attn_scratch_floats_, P.attn_ + tb * NH * HD, n, cs);
                 if (st.kv_q4) fwht256_inplace_cuda(P.attn_ + tb * NH * HD, (int64_t) n * NH, cs);   // back: H^-1 = H
-                for (int t = tb; t < te; ++t) {
-                    if (native_qsa_enabled())
-                        native_qsa_gate_apply(P.attn_ + t * NH * HD, P.qfull_ + t * NH * 2 * HD, P.attn32_ + t * NH * HD,
-                                              (int) NH, (int) HD, cs);
-                    else
+                if (native_qsa_enabled())
+                    native_qsa_gate_apply(P.attn_ + tb * NH * HD, P.qfull_ + tb * NH * 2 * HD, P.attn32_ + tb * NH * HD,
+                                          (int) (n * NH), (int) HD, cs);
+                else
+                    for (int t = tb; t < te; ++t)
                         qsa_gate_apply_f32(P.attn_ + t * NH * HD, P.qfull_ + t * NH * 2 * HD, s, P.attn32_ + t * NH * HD, cs);
-                }
                 native_quantize_q8_1(P.attn32_ + tb * NH * HD, P.xq_, (int) (NH * HD), n, cs);
                 native_mmvq(wo->native_type, wo->native_data, P.xq_, P.bo_ + tb * N, (int) (NH * HD), (int) N, n, cs);
             }
@@ -856,6 +874,8 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         h_tok_[t] = tokens[t];
         qsa_step_fill(h_step_ + t * kStepCount, pos0 + t, s);
         for (int64_t h = 0; h < g.n_head; ++h) h_pos_[t * g.n_head + h] = (int32_t) (pos0 + t);
+        for (int64_t h = 0; h < g.n_head_kv; ++h) h_pos_kv_[t * g.n_head_kv + h] = (int32_t) (pos0 + t);
+        for (int64_t h = 0; h < g.idx_q_heads; ++h) h_pos_iq_[t * g.idx_q_heads + h] = (int32_t) (pos0 + t);
     }
     if (ss.ple.ready()) {
         uint32_t rows[kVerifyMaxT * PLE_N_HEADS];

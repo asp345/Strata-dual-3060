@@ -104,8 +104,16 @@ struct PleOut {
 /// `shared_expert`.
 uint64_t ple_block_scratch_bytes();
 
+/// `key_in` / `value_in`: this token's key (hc_dim) and value (n_embd) projections, already computed by
+/// `ple_project_rows`; the block then skips its own.  `key_in` is normalized in place.
 void ple_block(const float* emb, const float* hidden, const float* hist_rows, const PleWeights& w,
-               PleOut& out, void* scratch, void* stream);
+               PleOut& out, void* scratch, void* stream, float* key_in = nullptr, float* value_in = nullptr);
+
+/// The key and value projections of `n` tokens (emb rows n_embd apart, n <= 8) in one pass over each weight, each row
+/// bitwise the one ple_block computes: key n x hc_dim, value n x n_embd.  Needs the BF16 key and the native BF16
+/// value path (ple_project_rows_available).
+bool ple_project_rows_available(const PleWeights& w);
+void ple_project_rows(const float* emb, int n, const PleWeights& w, float* key, float* value, void* stream);
 
 /// Advance the row-fastest normalized history by one token: hist[r,c] = old_hist[r+1,c], then append
 /// normalized[c] at row NG_HIST-1. One thread owns each channel, making the in-place shift well-defined.

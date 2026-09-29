@@ -224,8 +224,17 @@ uint64_t ple_block_scratch_bytes() {
     return ((f + 15) & ~(size_t) 15) + ((q + 15) & ~(size_t) 15) + e + 256;
 }
 
+bool ple_project_rows_available(const PleWeights& w) { return native_bf16 && w.key_bf16 != nullptr; }
+
+void ple_project_rows(const float* emb, int n, const PleWeights& w, float* key, float* value, void* stream) {
+    if (!ple_project_rows_available(w) || n < 1 || n > 8)
+        throw std::invalid_argument("ple_project_rows: needs the BF16 key, the native BF16 value and 1..8 rows");
+    bf16_gemv_fp32_mmvf_rows(emb, NG_N_EMBD, w.key_bf16, key, NG_HC_DIM, NG_N_EMBD, NG_HC_DIM, n, stream);
+    bf16_gemv_fp32_mmvf_rows(emb, NG_N_EMBD, w.value_bf16, value, NG_N_EMBD, NG_N_EMBD, NG_N_EMBD, n, stream);
+}
+
 void ple_block(const float* emb, const float* hidden, const float* hist_rows, const PleWeights& w,
-               PleOut& out, void* scratch, void* stream) {
+               PleOut& out, void* scratch, void* stream, float* key_in, float* value_in) {
     const bool native_key = w.key_native_data != nullptr && w.key_bf16 == nullptr;
     if (native_key && (!emb || !hidden || !hist_rows || !out.result || !scratch || !stream ||
                        !w.key_native_q8_1 || w.key_native_type != 42))
@@ -291,17 +300,18 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
     float* d_scratch = (float*) base;
     uint8_t* d_act = base + ((float_bytes + 15) & ~(size_t) 15);
     uint16_t* d_emb16 = (uint16_t*) (d_act + ((q8_bytes + 15) & ~(size_t) 15));
-    float* d_key = d_scratch;
-    float* d_query = d_key + hc_dim;
+    float* d_key = key_in != nullptr ? key_in : d_scratch;
+    float* d_query = d_scratch + hc_dim;
     float* d_norm = d_query + hc_dim;
     float* d_gated = d_norm + hc_dim;
     float* d_conv = d_gated + hc_dim;
-    float* d_value = d_conv + hc_dim;
-    float* d_gate = d_value + n_embd;
+    float* d_value = value_in != nullptr ? value_in : d_conv + hc_dim;
+    float* d_gate = d_conv + hc_dim + n_embd;
 
     // ---- key = grouped_norm(ple_key @ emb). The optional native projection
     // follows pinned CUDA Q8_1 MMVQ; the default retains its canonical Q8_0 path.
-    if (w.key_bf16 != nullptr) {
+    if (key_in != nullptr) {
+    } else if (w.key_bf16 != nullptr) {
         bf16_gemv_fp32_mmvf(emb, w.key_bf16, d_key, n_embd, hc_dim, stream);
     } else if (native_key) {
         native_quantize_q8_1(emb, w.key_native_q8_1, n_embd, 1, stream);
@@ -317,7 +327,8 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
     }
 
     // The value projection's independent option leaves the nonlinear PLE operations unchanged.
-    if (native_bf16) {
+    if (value_in != nullptr) {
+    } else if (native_bf16) {
         bf16_gemv_fp32_mmvf(emb, w.value_bf16, d_value, n_embd, n_embd, stream);
     } else {
         to_bf16_kernel<<<(n_embd + THREADS - 1) / THREADS, THREADS, 0, st>>>(emb, d_emb16, n_embd);
