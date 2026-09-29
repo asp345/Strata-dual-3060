@@ -623,15 +623,16 @@ bool MtpDrafter::prefill_rows(const float* R_rows, const int32_t* tok, const int
                 fwht256_inplace_cuda(kcur, b * NKV, cs_);
                 fwht256_inplace_cuda(vcur, b * NKV, cs_);
             }
-            for (int t = 0; t < b; ++t) {
-                const int32_t* st = step + (c + t) * 4;
-                if (st_.kv_q4)
-                    kv_append_q4_step(st_.k_q4, st_.v_q4, st_.page_table, st, kcur + t * KV, vcur + t * KV, s, cs_, &st_.host);
-                else if (st_.kv_int8)
-                    kv_append_q8_step(st_.k_q, st_.v_q, st_.k_scale, st_.v_scale, st_.page_table, st, kcur + t * KV,
-                                      vcur + t * KV, s, cs_, &st_.host);
-                else
-                    kv_append_step(st_.k_pool, st_.v_pool, st_.page_table, st, kcur + t * KV, vcur + t * KV, s, cs_, &st_.host);
+            const int32_t* st = step + c * kStepCount;
+            if (st_.kv_q4) {
+                for (int t = 0; t < b; ++t)
+                    kv_append_q4_step(st_.k_q4, st_.v_q4, st_.page_table, st + t * kStepCount, kcur + t * KV, vcur + t * KV,
+                                      s, cs_, &st_.host);
+            } else if (st_.kv_int8) {
+                kv_append_q8_step(st_.k_q, st_.v_q, st_.k_scale, st_.v_scale, st_.page_table, st, kcur, vcur, s, cs_,
+                                  &st_.host, b);
+            } else {
+                kv_append_step(st_.k_pool, st_.v_pool, st_.page_table, st, kcur, vcur, s, cs_, &st_.host, b);
             }
         }
     } catch (const std::exception& e) {

@@ -32,9 +32,13 @@ __global__ void kv_append_q8_kernel(int8_t* __restrict__ k_q, int8_t* __restrict
                                     const int32_t* __restrict__ table, const int32_t* __restrict__ step,
                                     const float* __restrict__ kcur, const float* __restrict__ vcur, int kv_heads,
                                     int head_dim, int page_size, KvHostPools host) {
+    const int r = blockIdx.z >> 1;                                 // the row (cell) of a batch
+    step += r * kStepCount;
+    kcur += (size_t) r * kv_heads * head_dim;
+    vcur += (size_t) r * kv_heads * head_dim;
     const long long pos = (long long) __ldg(step + kStepPos);
     const int h = blockIdx.x, g = blockIdx.y, t = threadIdx.x;
-    const bool is_v = blockIdx.z == 1;
+    const bool is_v = (blockIdx.z & 1) == 1;
     const int groups = head_dim / KV_Q8_GROUP;
     const float x = (is_v ? vcur : kcur)[h * head_dim + g * KV_Q8_GROUP + t];
     // max |x| over the 64 values: two warps, then combine through shared memory in a fixed order
@@ -102,9 +106,9 @@ __global__ void kv_gather_q8_kernel(const int8_t* __restrict__ k_q, const int8_t
 
 void kv_append_q8_step(int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_scale, const int32_t* page_table,
                        const int32_t* step, const float* kcur, const float* vcur, const QsaShapes& s, void* stream,
-                       const KvHostPools* host) {
+                       const KvHostPools* host, int n_rows) {
     validate(s, "kv_append_q8");
-    const dim3 grid((unsigned) s.n_head_kv, (unsigned) (s.head_dim / KV_Q8_GROUP), 2);
+    const dim3 grid((unsigned) s.n_head_kv, (unsigned) (s.head_dim / KV_Q8_GROUP), 2u * (unsigned) n_rows);
     kv_append_q8_kernel<<<grid, KV_Q8_GROUP, 0, (cudaStream_t) stream>>>(
         k_q, v_q, k_scale, v_scale, page_table, step, kcur, vcur, (int) s.n_head_kv, (int) s.head_dim,
         (int) s.page_size, host ? *host : KvHostPools{});

@@ -122,6 +122,10 @@ __global__ void kv_append_kernel(uint16_t* __restrict__ k_pool, uint16_t* __rest
                                  const int32_t* __restrict__ table, const int32_t* __restrict__ step,
                                  const float* __restrict__ kcur, const float* __restrict__ vcur, int kv_heads,
                                  int head_dim, int page_size, KvHostPools host) {
+    const int r = blockIdx.y;                                      // the row (cell) of a batch
+    step += r * kStepCount;
+    kcur += (size_t) r * kv_heads * head_dim;
+    vcur += (size_t) r * kv_heads * head_dim;
     const long long pos = (long long) __ldg(step + kStepPos);
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= kv_heads * head_dim) return;
@@ -584,12 +588,13 @@ const int32_t* step_upload_width(int64_t width, const QsaShapes& s) {
 // buffer and forward this token's counts as the capacities.
 
 void kv_append_step(uint16_t* k_pool, uint16_t* v_pool, const int32_t* page_table, const int32_t* step,
-                    const float* kcur, const float* vcur, const QsaShapes& s, void* stream, const KvHostPools* host) {
+                    const float* kcur, const float* vcur, const QsaShapes& s, void* stream, const KvHostPools* host,
+                    int n_rows) {
     validate(s, "kv_append");
     if (step == nullptr) fail("kv_append: step is null");
-    // The grid is the head x dim count, which is a CONSTANT - `kv_append` writes one cell.
+    // The grid is the head x dim count by the rows - CONSTANTS for a captured graph.
     const long long n = s.n_head_kv * s.head_dim;
-    kv_append_kernel<<<grid_for(n, THREADS), THREADS, 0, (cudaStream_t) stream>>>(
+    kv_append_kernel<<<dim3((unsigned) grid_for(n, THREADS), (unsigned) n_rows), THREADS, 0, (cudaStream_t) stream>>>(
         k_pool, v_pool, page_table, step, kcur, vcur, (int) s.n_head_kv, (int) s.head_dim, (int) s.page_size,
         host ? *host : KvHostPools{});
     check_launch("kv_append");

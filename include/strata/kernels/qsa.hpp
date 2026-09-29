@@ -359,8 +359,9 @@ struct KvHostPools;   // kv_stream.hpp
 
 /// The cell's position comes from `step`, so this is the form a graph may contain. With a host copy (KV streaming)
 /// the cell is written there too, and to VRAM only if its block is resident.
+/// `n_rows` cells at once: row r's step record at step + r * kStepCount, its K/V rows kv_heads * head_dim apart.
 void kv_append_step(uint16_t* k_pool, uint16_t* v_pool, const int32_t* page_table, const int32_t* step,
                     const float* kcur, const float* vcur, const QsaShapes& s, void* stream,
-                    const KvHostPools* host = nullptr);
+                    const KvHostPools* host = nullptr, int n_rows = 1);
 
 }  // namespace strata::kernels
