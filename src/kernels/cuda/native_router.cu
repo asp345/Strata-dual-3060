@@ -43,9 +43,12 @@ __device__ __forceinline__ float warp_max(float value) {
 }
 __launch_bounds__(256, 1)
 __global__ void route(const float* __restrict__ logits, int32_t* __restrict__ ids,
-                      float* __restrict__ weights) {
-    // Preserve the pinned 32x8 block geometry; only row zero is active here.
+                      float* __restrict__ weights, int64_t logits_stride) {
+    // Preserve the pinned 32x8 block geometry; only row zero is active here. Block b routes token b.
     if (threadIdx.y != 0) return;
+    logits += blockIdx.x * logits_stride;
+    ids += blockIdx.x * 10;
+    weights += blockIdx.x * 10;
     const int lane = threadIdx.x;
     float values[16];
 #pragma unroll
@@ -110,7 +113,17 @@ void native_router_top10(const float* logits, int32_t* ids, float* weights, void
         || overlap(logits, 512 * 4, ids, 10 * 4) || overlap(logits, 512 * 4, weights, 10 * 4)
         || overlap(ids, 10 * 4, weights, 10 * 4))
         throw std::invalid_argument("native router requires a stream, aligned spans, and disjoint outputs");
-    route<<<1, dim3(32, 8), 0, static_cast<cudaStream_t>(stream)>>>(logits, ids, weights);
+    route<<<1, dim3(32, 8), 0, static_cast<cudaStream_t>(stream)>>>(logits, ids, weights, 0);
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
+void native_router_top10_rows(const float* logits, int64_t logits_stride, int32_t* ids, float* weights, int n,
+                              void* stream) {
+    if (!stream || n < 1 || logits_stride < 512 || !valid(logits, ((size_t) (n - 1) * logits_stride + 512) * 4)
+        || !valid(ids, (size_t) n * 10 * 4) || !valid(weights, (size_t) n * 10 * 4)
+        || overlap(ids, (size_t) n * 10 * 4, weights, (size_t) n * 10 * 4))
+        throw std::invalid_argument("native router rows requires a stream, aligned spans, and disjoint outputs");
+    route<<<(unsigned) n, dim3(32, 8), 0, static_cast<cudaStream_t>(stream)>>>(logits, ids, weights, logits_stride);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }

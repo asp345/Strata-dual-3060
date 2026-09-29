@@ -502,8 +502,7 @@ bool Verifier::record_window(int T, Part& P, std::string& err) {
                 };
                 float* idx_raw = P.idx_raw_L_ + (size_t) (qi - P.qsa0) * MT * ID;
                 native_quantize_q8_1(xm, P.xq_, (int) N, n, cs);
-                for (int t = tb; t < te; ++t)
-                    bf16_gemv_fp32_mmvf(P.mixed_ + t * N, (const uint16_t*) wik->data, idx_raw + t * ID, (int) N, (int) ID, cs);
+                bf16_gemv_fp32_mmvf_rows(P.mixed_ + tb * N, N, (const uint16_t*) wik->data, idx_raw + tb * ID, ID, N, ID, n, cs);
                 native_mmvq(wk->native_type, wk->native_data, P.xq_, P.kcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD), n, cs);
                 native_mmvq(wv->native_type, wv->native_data, P.xq_, P.vcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD), n, cs);
                 for (int t = tb; t < te; ++t) norm_rope(P.kcur_ + t * NKV * HD, wkn, (int) NKV, (int) HD, P.pos_ + t * NH);
@@ -541,11 +540,9 @@ bool Verifier::record_window(int T, Part& P, std::string& err) {
                     norm_rope(qc, wqn, (int) NH, (int) HD, P.pos_ + t * NH);
                     if (st.kv_q4) fwht256_inplace_cuda(qc, NH, cs);   // <Hq, Hk> = <q, k>
                 }
-                for (int t = tb; t < te; ++t) {
-                    float* qx = P.qidx_ + t * IQ * ID;
-                    bf16_gemv_fp32_mmvf(P.mixed_ + t * N, (const uint16_t*) wiq->data, qx, (int) N, (int) (IQ * ID), cs);
-                    norm_rope(qx, wiqn, (int) IQ, (int) ID, P.pos_ + t * NH);
-                }
+                bf16_gemv_fp32_mmvf_rows(P.mixed_ + tb * N, N, (const uint16_t*) wiq->data, P.qidx_ + tb * IQ * ID, IQ * ID, N,
+                                         IQ * ID, n, cs);
+                for (int t = tb; t < te; ++t) norm_rope(P.qidx_ + t * IQ * ID, wiqn, (int) IQ, (int) ID, P.pos_ + t * NH);
                 qsa_block_scores(st.idx_pooled, st.idx_dead, P.qidx_ + tb * IQ * ID, P.step_ + tb * kStepCount, n, max_blocks_,
                                  s, P.scores_ + (size_t) tb * max_blocks_, cs);
                 qsa_block_topk(P.scores_ + (size_t) tb * max_blocks_, P.step_ + tb * kStepCount, n, max_blocks_, cap_, s,
@@ -571,10 +568,10 @@ bool Verifier::record_window(int T, Part& P, std::string& err) {
             return false;
         }
         gr_read_group(1, true, P.inj_, P.inj2_);
-        for (int t = tb; t < te; ++t) {
+        {
             MoEBuffers mb = pst.moe;
-            mb.logits = P.logits_ + t * NE; mb.ids = P.ids_ + t * K; mb.weights = P.w_ + t * K;
-            if (!moe_route(wt, g, l, K, mb, P.mixed_ + t * N, cs, err, nullptr)) return false;
+            mb.logits = P.logits_ + tb * NE; mb.ids = P.ids_ + tb * K; mb.weights = P.w_ + tb * K;
+            if (!moe_route_rows(wt, g, l, K, mb, P.mixed_ + tb * N, n, NE, cs, err)) return false;
         }
         doorbell_publish(xm, P.ids_ + tb * K, P.w_ + tb * K, (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N,
                          m_ids_ + tb * K, m_w_ + tb * K, m_seq_, cs);
@@ -590,7 +587,7 @@ bool Verifier::record_window(int T, Part& P, std::string& err) {
             nsw.up_type = wsu->native_type; nsw.up_data = wsu->native_data;
             nsw.down_type = wsd->native_type; nsw.down_data = wsd->native_data;
             nsw.q8_1 = P.xq_;
-            for (int t = tb; t < te; ++t) f32_to_bf16_bulk(P.mixed_ + t * N, P.sh_bf16_ + t * N, N, cs);
+            f32_to_bf16_bulk(P.mixed_ + tb * N, P.sh_bf16_ + tb * N, (int64_t) n * N, cs);
             try {
                 shared_expert_multi(n, xm, P.sh_bf16_ + tb * N, nsw, (const uint16_t*) wgi->data, P.sh_gate_ + (size_t) tb * g.n_ff,
                                     P.sh_up_ + (size_t) tb * g.n_ff, P.sh_g_ + tb, P.shared_ + tb * N, N, g.n_ff, cs);
@@ -647,12 +644,13 @@ bool Verifier::record_window(int T, Part& P, std::string& err) {
         }
         grouped(p_ptr2, p_start2, p_counts + 2);
         wait_flag_ge(m_flag_, ring, cs);                       // the CPU's share is in the mapped rows
-        copy_from_mapped(P.parts_ + (size_t) tb * K * N, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K * N, cs);
+        copy_rows_from_mapped(P.parts_ + (size_t) tb * K * N, m_ymiss_ + (size_t) tb * K * N, p_dst, p_counts + 1,
+                              (int64_t) n * K, N, cs);
         moe_hit_add(P.parts_ + (size_t) tb * K * N, hit_out, p_dst, p_counts + 1, cap, N, cs);
-        for (int t = tb; t < te; ++t) {
+        {
             MoEBuffers mb = pst.moe;
-            mb.weights = P.w_ + t * K; mb.shared = P.shared_ + t * N;
-            if (!moe_combine_parts(g, l, K, mb, P.parts_ + (size_t) t * K * N, P.bo_ + t * N, cs, err)) return false;
+            mb.weights = P.w_ + tb * K; mb.shared = P.shared_ + tb * N;
+            if (!moe_combine_parts_rows(g, l, K, mb, P.parts_ + (size_t) tb * K * N, P.bo_ + tb * N, n, cs, err)) return false;
         }
         if (l == g.n_layers - 1) {
             for (int t = tb; t < te; ++t) gr_write(Rt(t), P.bo_ + t * N, P.inj2_ + t * HC, gs, Rt(t), cs);

@@ -237,6 +237,35 @@ void copy_from_mapped(float* dst, const float* src, int64_t n, void* stream) {
     check_launch("copy_from_mapped");
 }
 
+// block r: row r of the buffer - zeros when the GPU computes it (listed in `gpu_rows`), else the mapped row
+__global__ void copy_rows_from_mapped_kernel(float4* __restrict__ dst, const volatile float4* src,
+                                             const int32_t* __restrict__ gpu_rows, const int32_t* __restrict__ n_gpu,
+                                             int row4) {
+    const int r = blockIdx.x;
+    bool gpu = false;
+    for (int h = 0; h < *n_gpu; ++h)
+        if (gpu_rows[h] == r) { gpu = true; break; }
+    float4* d = dst + (size_t) r * row4;
+    if (gpu) {
+        for (int i = threadIdx.x; i < row4; i += blockDim.x) d[i] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        return;
+    }
+    const float4* s = const_cast<const float4*>(src) + (size_t) r * row4;
+    for (int i = threadIdx.x; i < row4; i += blockDim.x) d[i] = s[i];
+}
+
+void copy_rows_from_mapped(float* dst, const float* src, const int32_t* gpu_rows, const int32_t* n_gpu, int64_t n_rows,
+                           int64_t row_floats, void* stream) {
+    if (n_rows <= 0) return;
+    if ((row_floats & 3) != 0 || ((uintptr_t) dst & 15) != 0 || ((uintptr_t) src & 15) != 0) {
+        std::fprintf(stderr, "copy_rows_from_mapped: rows must be multiples of 4 floats and both pointers 16-byte aligned\n");
+        std::exit(1);
+    }
+    copy_rows_from_mapped_kernel<<<(unsigned) n_rows, 256, 0, (cudaStream_t) stream>>>(
+        (float4*) dst, (const volatile float4*) src, gpu_rows, n_gpu, (int) (row_floats / 4));
+    check_launch("copy_rows_from_mapped");
+}
+
 __global__ void doorbell_publish_kernel(const float* __restrict__ x, const int32_t* __restrict__ ids,
                                         const float* __restrict__ w, int n, int k, float* x_out, int32_t* ids_out,
                                         float* w_out, uint32_t* seq) {

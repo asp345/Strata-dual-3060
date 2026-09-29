@@ -167,6 +167,11 @@ bool moe_layer(const WeightTable& tables, const ModelGeometry& g, int64_t layer,
 bool moe_route(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t k, const MoEBuffers& b,
                const float* x, void* stream, std::string& err, const Doorbell* db = nullptr);
 
+/// `moe_route` for `n` consecutive rows of `x` (no doorbell): row t's logits at b.logits + t * logits_stride, its
+/// ids and weights at b.ids / b.weights + t * k. The native projection reads the router weight once for all rows.
+bool moe_route_rows(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t k, const MoEBuffers& b,
+                    const float* x, int n, int64_t logits_stride, void* stream, std::string& err);
+
 /// The finishing half: the shared expert and the combination.
 ///
 /// **`parts` MUST BE THE EXPERTS THIS LAYER'S OWN ROUTER SELECTED.**  It is combined with `b.weights`, which
@@ -182,6 +187,11 @@ bool moe_shared(const WeightTable& tables, const ModelGeometry& g, int64_t layer
                 const float* x, void* stream, std::string& err);
 bool moe_combine_parts(const ModelGeometry& g, int64_t layer, int64_t k, const MoEBuffers& b, const float* parts,
                        float* out, void* stream, std::string& err);
+
+/// `moe_combine_parts` for `n` consecutive tokens: token t's weights at b.weights + t * k, shared at
+/// b.shared + t * n_embd, parts at parts + t * k * n_embd, output at out + t * n_embd.
+bool moe_combine_parts_rows(const ModelGeometry& g, int64_t layer, int64_t k, const MoEBuffers& b, const float* parts,
+                            float* out, int n, void* stream, std::string& err);
 
 /// Plan v0.3 P3 (default ON): the shared expert runs at the END OF `pre[l]`, after the doorbell has rung, so
 /// the GPU computes it while the host runs the CPU pool; `post[l]` then only combines.  Same kernels on the

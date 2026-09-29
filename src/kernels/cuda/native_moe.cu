@@ -36,6 +36,11 @@ __global__ void combine(const float* __restrict__ parts, const float* __restrict
                         int64_t n_embd, int k) {
     const int64_t col = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (col >= n_embd) return;
+    // grid row y: token y of a window (its k parts, k weights, shared and output rows follow the previous token's)
+    parts += int64_t(blockIdx.y) * k * n_embd;
+    weights += int64_t(blockIdx.y) * k;
+    if (shared) shared += int64_t(blockIdx.y) * n_embd;
+    output += int64_t(blockIdx.y) * n_embd;
     float sum = parts[col] * weights[0];
     for (int expert = 1; expert < k; ++expert) {
         sum += parts[int64_t(expert) * n_embd + col] * weights[expert];
@@ -67,6 +72,24 @@ void native_moe_combine(const float* parts, const float* weights, const float* s
             || (shared && overlap(output, row_bytes, shared, row_bytes)))
         throw std::invalid_argument("native MoE combine requires aligned spans and disjoint output");
     combine<<<unsigned((n_embd + 255) / 256), 256, 0, static_cast<cudaStream_t>(stream)>>>(
+        parts, weights, shared, output, n_embd, int(k));
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
+void native_moe_combine_rows(const float* parts, const float* weights, const float* shared,
+                             float* output, int64_t n_embd, int64_t k, int n, void* stream) {
+    if (!stream || n_embd <= 0 || n_embd > std::numeric_limits<int>::max() || k < 1 || k > 15 || n < 1 || n > 65535)
+        throw std::invalid_argument("native MoE combine rows requires a stream, positive width, 1..15 experts and "
+                                    "1..65535 rows");
+    const size_t row_bytes = size_t(n_embd) * sizeof(float) * size_t(n);
+    const size_t part_bytes = row_bytes * size_t(k), weight_bytes = size_t(k) * size_t(n) * sizeof(float);
+    if (!valid_span(parts, part_bytes) || !valid_span(weights, weight_bytes) || !valid_span(output, row_bytes)
+            || (shared && !valid_span(shared, row_bytes))
+            || overlap(output, row_bytes, parts, part_bytes)
+            || overlap(output, row_bytes, weights, weight_bytes)
+            || (shared && overlap(output, row_bytes, shared, row_bytes)))
+        throw std::invalid_argument("native MoE combine rows requires aligned spans and disjoint output");
+    combine<<<dim3(unsigned((n_embd + 255) / 256), unsigned(n)), 256, 0, static_cast<cudaStream_t>(stream)>>>(
         parts, weights, shared, output, n_embd, int(k));
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));

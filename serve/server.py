@@ -526,6 +526,7 @@ class Service:
         self.fifo = threading.Lock()
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
+        self.web = True                                # the web app (chat page, Monitor) and its hardware sampler
         self.status = {"busy": False, "queued": 0}      # GET /status: what the model is doing right now
         self.history = collections.deque(maxlen=500)    # the last finished requests, newest last (GET /metrics)
         # since the server started (the Monitor's totals, issue #35)
@@ -1116,6 +1117,9 @@ def make_handler(svc: Service):
 
         def do_GET(self):
             path = self.path.split("?")[0].rstrip("/")
+            if not svc.web and (path in ("", "/metrics", "/settings") or path.startswith(("/web/", "/fonts/"))):
+                self._json(404, {"error": {"message": "not found"}})
+                return
             if path.startswith("/fonts/"):
                 # the web app's font (Outfit, OFL: serve/web/fonts); the page falls back to the system font
                 name = path[len("/fonts/"):]
@@ -1194,7 +1198,7 @@ def make_handler(svc: Service):
             if not self._authorized():
                 return
             path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
-            if path == "/settings":
+            if svc.web and path == "/settings":
                 self._settings()
                 return
             try:
@@ -1362,7 +1366,8 @@ def lan_addresses() -> list[str]:
 
 
 def serve(svc: Service, host="127.0.0.1", port=8095) -> ThreadingHTTPServer:
-    svc.start_telemetry()
+    if svc.web:
+        svc.start_telemetry()
     httpd = Server((host, port), make_handler(svc))
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     return httpd
@@ -1483,6 +1488,9 @@ def main() -> int:
     ap.add_argument("--tokenizer", default=str(ROOT / "pack/full/tokenizer"),
                     help="pack tokenizer directory (falls back to a byte tokenizer if absent)")
     ap.add_argument("--open", action="store_true", help="open the local page in the browser once the model is ready")
+    ap.add_argument("--no-web", action="store_true",
+                    help="the API only: no chat page, no Monitor and no hardware sampler (also \"web\": false in the "
+                         "config)")
     ap.add_argument("--fit-max-tokens", action="store_true",
                     help="clamp max_tokens to the remaining context instead of rejecting the request "
                          "(default: reject with 400, like llama.cpp; also \"fit_max_tokens\": true in the config)")
@@ -1544,6 +1552,7 @@ def main() -> int:
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
     svc.api_key = a.api_key or cfg.get("api_key", "")
     svc.gpu_index = cfg.get("gpu") or 0                 # the Monitor reads the card the engine runs on (issue #51)
+    svc.web = not a.no_web and cfg.get("web") is not False
     if a.config:                                        # the Chat settings shared with other apps, from last time
         svc.shared_path = str(Path(a.config).with_suffix("")) + ".shared-settings.json"
         try:
@@ -1565,12 +1574,14 @@ def main() -> int:
     print(f"ready: http://{here}:{a.port}/v1  (OpenAI: /v1/chat/completions, Anthropic: /v1/messages, "
           f"context {engine.max_context} tokens{', images on' if vision else ''}"
           f"{', API key required' if svc.api_key else ''})", flush=True)
-    print(f"       open http://{here}:{a.port}/ in a browser to chat; close this window to stop the model", flush=True)
+    if svc.web:
+        print(f"       open http://{here}:{a.port}/ in a browser to chat; close this window to stop the model", flush=True)
     if a.host not in ("127.0.0.1", "localhost", "::1"):
         # issue #26: reachable from other devices - say at which address, and what can still block it
         ips = lan_addresses()
         for ip in ips:
-            print(f"       from other devices: http://{ip}:{a.port}/   (API: http://{ip}:{a.port}/v1)", flush=True)
+            print(f"       from other devices: http://{ip}:{a.port}/v1" if not svc.web else
+                  f"       from other devices: http://{ip}:{a.port}/   (API: http://{ip}:{a.port}/v1)", flush=True)
         if not ips:
             print("       from other devices: http://<this PC's IP address>:" + str(a.port) + "/", flush=True)
         if not svc.api_key:
@@ -1581,7 +1592,7 @@ def main() -> int:
                   "in an admin PowerShell:\n         New-NetFirewallRule -DisplayName \"Strata " + str(a.port) + "\" "
                   "-Direction Inbound -Protocol TCP -LocalPort " + str(a.port) + " -Action Allow -Profile Private\n"
                   "       (and set this network to Private in Windows' network settings)", flush=True)
-    if a.open:
+    if a.open and svc.web:
         import webbrowser
         webbrowser.open(f"http://{'127.0.0.1' if a.host in ('0.0.0.0', '') else a.host}:{a.port}/")
     try:

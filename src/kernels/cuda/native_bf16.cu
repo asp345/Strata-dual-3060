@@ -70,6 +70,55 @@ __global__ void bf16_f32_mmvf_kernel(const float* __restrict__ x, const uint16_t
     if (t == 0) y[blockIdx.x] = acc;
 }
 
+// The kernel above for up to kMaxRows activation rows at once: each weight pair is loaded once and applied to every
+// row, and each row keeps its own accumulator, reduction and store, so row r's result is bit-identical to a
+// single-row launch on it.
+constexpr int kMaxRows = 8;
+
+template <int BLOCK_SIZE>
+__global__ void bf16_f32_mmvf_rows_kernel(const float* __restrict__ x, int64_t x_stride, const uint16_t* __restrict__ w,
+                                         float* __restrict__ y, int64_t y_stride, int n_in, int n_rows) {
+    const int t = threadIdx.x;
+    const uint16_t* row = w + (size_t) blockIdx.x * n_in;
+    const uint32_t* weights2 = reinterpret_cast<const uint32_t*>(row);
+    __shared__ float partials[kMaxRows][32];
+    if constexpr (BLOCK_SIZE > 32) {
+        if (t < 32)
+            for (int r = 0; r < kMaxRows; ++r) partials[r][t] = 0.0f;
+        __syncthreads();
+    }
+    float acc[kMaxRows];
+#pragma unroll
+    for (int r = 0; r < kMaxRows; ++r) acc[r] = 0.0f;
+    for (int pair = t; pair < n_in / 2; pair += BLOCK_SIZE) {
+        const uint32_t weight = weights2[pair];
+        const float w0 = f32_from_bf16((uint16_t) weight), w1 = f32_from_bf16((uint16_t) (weight >> 16));
+#pragma unroll
+        for (int r = 0; r < kMaxRows; ++r) {
+            if (r < n_rows) {
+                const float2 input = reinterpret_cast<const float2*>(x + (size_t) r * x_stride)[pair];
+                acc[r] = __fmaf_rn(w0, input.x, acc[r]);
+                acc[r] = __fmaf_rn(w1, input.y, acc[r]);
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < kMaxRows; ++r) acc[r] = mmvf_warp_sum(acc[r]);
+    if constexpr (BLOCK_SIZE > 32) {
+        if ((t & 31) == 0)
+#pragma unroll
+            for (int r = 0; r < kMaxRows; ++r) partials[r][t / 32] = acc[r];
+        __syncthreads();
+        if (t < 32)
+#pragma unroll
+            for (int r = 0; r < kMaxRows; ++r) acc[r] = mmvf_warp_sum(partials[r][t]);
+    }
+    if (t == 0)
+#pragma unroll
+        for (int r = 0; r < kMaxRows; ++r)
+            if (r < n_rows) y[(size_t) r * y_stride + blockIdx.x] = acc[r];
+}
+
 int mmvf_block_size(int64_t n_in) {
     int best = 32;
     int64_t best_iterations = (n_in + 63) / 64;
@@ -112,6 +161,37 @@ void bf16_gemv_fp32_mmvf(const float* x, const uint16_t* w, float* y,
     const cudaError_t result = cudaGetLastError();
     if (result != cudaSuccess)
         throw std::runtime_error(std::string("bf16_gemv_fp32_mmvf launch: ") + cudaGetErrorString(result));
+}
+
+void bf16_gemv_fp32_mmvf_rows(const float* x, int64_t x_stride, const uint16_t* w, float* y, int64_t y_stride,
+                              int64_t n_in, int64_t n_out, int n_rows, void* stream) {
+    if (n_in <= 0 || (n_in & 1) != 0 || n_in > std::numeric_limits<int>::max() ||
+        n_out <= 0 || n_out > std::numeric_limits<int>::max() || n_rows < 1 || n_rows > kMaxRows ||
+        (x_stride & 1) != 0)
+        throw std::invalid_argument("bf16_gemv_fp32_mmvf_rows: require positive even n_in, positive n_out <= INT_MAX, "
+                                    "1..8 rows and an even x stride");
+    if (x == nullptr || w == nullptr || y == nullptr ||
+        (reinterpret_cast<uintptr_t>(x) & 7u) != 0 ||
+        (reinterpret_cast<uintptr_t>(w) & 3u) != 0 ||
+        (reinterpret_cast<uintptr_t>(y) & 3u) != 0)
+        throw std::invalid_argument("bf16_gemv_fp32_mmvf_rows: null or misaligned pointer");
+    const cudaStream_t st = (cudaStream_t) stream;
+#define STRATA_MMVF_ROWS_CASE(N) case N: \
+    bf16_f32_mmvf_rows_kernel<N><<<(unsigned) n_out, N, 0, st>>>(x, x_stride, w, y, y_stride, (int) n_in, n_rows); break
+    switch (mmvf_block_size(n_in)) {
+        STRATA_MMVF_ROWS_CASE(32);
+        STRATA_MMVF_ROWS_CASE(64);
+        STRATA_MMVF_ROWS_CASE(96);
+        STRATA_MMVF_ROWS_CASE(128);
+        STRATA_MMVF_ROWS_CASE(160);
+        STRATA_MMVF_ROWS_CASE(192);
+        STRATA_MMVF_ROWS_CASE(224);
+        STRATA_MMVF_ROWS_CASE(256);
+    }
+#undef STRATA_MMVF_ROWS_CASE
+    const cudaError_t result = cudaGetLastError();
+    if (result != cudaSuccess)
+        throw std::runtime_error(std::string("bf16_gemv_fp32_mmvf_rows launch: ") + cudaGetErrorString(result));
 }
 
 

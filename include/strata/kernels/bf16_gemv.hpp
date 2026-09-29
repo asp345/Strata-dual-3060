@@ -45,4 +45,10 @@ void bf16_gemv_split(const uint16_t* x, const uint16_t* w, float* y, int64_t n_i
 void bf16_gemv_fp32_mmvf(const float* x, const uint16_t* w, float* y,
                          int64_t n_in, int64_t n_out, void* stream);
 
+/// `bf16_gemv_fp32_mmvf` on 1..8 activation rows at once (row r at x + r * x_stride, its output at
+/// y + r * y_stride), reading the weight once; row r's output is bit-identical to a single-row call.
+/// x_stride must be even; alignment and overlap rules as above.
+void bf16_gemv_fp32_mmvf_rows(const float* x, int64_t x_stride, const uint16_t* w, float* y, int64_t y_stride,
+                              int64_t n_in, int64_t n_out, int n_rows, void* stream);
+
 }  // namespace strata::kernels

@@ -2,7 +2,7 @@
 //
 // The n-gram table (26.8 GiB) stays on the SSD and must never occupy RAM, including the OS file cache. A memory
 // map cannot promise that; an unbuffered read can. On Windows this is FILE_FLAG_NO_BUFFERING | OVERLAPPED with
-// an I/O completion port; on Linux, O_DIRECT (synchronous pread for now; io_uring is phase L).
+// an I/O completion port; on Linux, O_DIRECT preads on a pool of threads.
 //
 // Contract of every read: offset, length and buffer address are multiples of `alignment()` (4096 here).
 // Reads past end of file return the bytes that exist; `Completion::bytes` says how many.

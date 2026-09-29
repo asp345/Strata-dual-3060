@@ -1051,7 +1051,10 @@ def start(cfg_path: Path, port: int | None, gpu: int | None = None, open_browser
     say("  restart). That is normal: please wait and don't close this window - the browser opens when it is ready.")
     say("  Later, closing this window stops the model.")
     say("  " + "-" * 100)
-    return subprocess.call(cmd)
+    if WIN:   # Windows' exec starts a new process and returns to the console at once
+        return subprocess.call(cmd)
+    sys.stdout.flush()
+    os.execv(cmd[0], cmd)   # the server takes this process's place: setup's own memory is not kept while it serves
 
 
 def write_run_script(model, cfg_path, port):

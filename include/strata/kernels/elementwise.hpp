@@ -102,6 +102,10 @@ void doorbell_wait(const uint32_t* d_flag, const uint32_t* d_seq, void* stream);
 /// device memory with a kernel, so the handoff stays on the compute queue (a memcpy node is a copy-engine
 /// operation, which WDDM submits separately and which measured 67 flushes per token).
 void copy_from_mapped(float* dst, const float* src, int64_t n, void* stream);
+/// `n_rows` rows of `row_floats` from mapped host memory, except the rows listed in the device array
+/// `gpu_rows[0 .. *n_gpu)`, which are written as zeros (rows the host left zero for the GPU's own results).
+void copy_rows_from_mapped(float* dst, const float* src, const int32_t* gpu_rows, const int32_t* n_gpu, int64_t n_rows,
+                           int64_t row_floats, void* stream);
 
 /// Plan v0.3 P3: the doorbell's payload and its ring in ONE kernel.  Copies `x` (n floats), `ids` and `weights`
 /// (k each) into the mapped host regions, fences, and increments the mapped sequence number - replacing three

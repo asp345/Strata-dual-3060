@@ -348,6 +348,17 @@ q8k_bytes(g.n_embd),
 // x_q8k
 };    uint64_t total = 0;    for (uint64_t v : parts) total += (v + 15) & ~(uint64_t) 15;    return total;}
 uint64_t moe_buffers_init(const ModelGeometry& g, int64_t k, void* base, MoEBuffers& b) {    const uint64_t parts[] = {        (uint64_t) g.n_embd * 2, (uint64_t) g.n_embd * 2, (uint64_t) g.n_expert * 4,        (uint64_t) k * 4, (uint64_t) k * 4, (uint64_t) g.n_embd * 4,        strata::kernels::shared_expert_scratch_bytes(g.n_ff),        (uint64_t) (g.n_embd / 32) * 34, q8k_bytes(g.n_embd),    };    uint8_t* p = (uint8_t*) base;    void* ptr[9];    uint64_t total = 0;    for (int i = 0; i < 9; ++i) {        ptr[i] = p;        const uint64_t al = (parts[i] + 15) & ~(uint64_t) 15;        p += al;        total += al;    }    b.x_bf16 = (uint16_t*) ptr[0];    b.x_f16 = (uint16_t*) ptr[1];    b.logits = (float*) ptr[2];    b.ids = (int*) ptr[3];    b.weights = (float*) ptr[4];    b.shared = (float*) ptr[5];    b.sh_scratch = (float*) ptr[6];    b.x_q8_0 = (uint8_t*) ptr[7];    b.x_q8k = (uint8_t*) ptr[8];    return total;}
+// ---- routing: softmax over ALL experts, stable descending argsort with ties by index, gather, renormalise
+// the native fused router is canonical-512x10 only; anything else takes the generic top-k kernel
+static bool route_logits(const LayerView& v, const ModelGeometry& g, int64_t k, const float* logits, int32_t* ids,
+                         float* weights, void* stream, std::string& err) {
+    using namespace strata::kernels;
+    if (native_router_enabled() && g.n_expert == 512 && k == 10) {
+        try { native_router_top10(logits, ids, weights, stream); }
+        catch (const std::exception& error) { err = v.name("router") + ": " + error.what(); return false; }
+    } else router_top10(logits, 1, (int) g.n_expert, (int) k, ids, weights, stream);
+    return true;
+}
 bool moe_route(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t k, const MoEBuffers& b,               const float* x, void* stream, std::string& err, const Doorbell* db) {    using namespace strata::kernels;    const LayerView v(tables, layer);    const WeightRef* w_router = v.get("ffn_gate_inp.weight");    if (w_router == nullptr) { err = v.name("ffn_gate_inp.weight") + " is missing"; return false; }    if (k < 1 || k > 64) { err = "moe_route: k must be 1..64"; return false; }
 // ---- the router's activation.  The router's weight is BF16 and that is the one `ref/moe.py` singles out.
 if (!native_bf16_projections) f32_to_bf16_bulk(x, b.x_bf16, g.n_embd, stream);
@@ -361,12 +372,7 @@ if (!native_bf16_projections) f32_to_bf16_bulk(x, b.x_bf16, g.n_embd, stream);
 //      `bf16_gemv_split` exists for precisely this case; its own header says so.  Measured here:
 //      LEDGER L41 -> L42.
 project_bf16(x, b.x_bf16, (const uint16_t*) w_router->data, b.logits, g.n_embd, g.n_expert, true, stream);
-// ---- routing: softmax over ALL experts, stable descending argsort with ties by index, gather, renormalise
-// the native fused router is canonical-512x10 only; anything else takes the generic top-k kernel
-if (native_router_enabled() && g.n_expert == 512 && k == 10) {
-    try { native_router_top10(b.logits, b.ids, b.weights, stream); }
-    catch (const std::exception& error) { err = v.name("router") + ": " + error.what(); return false; }
-} else router_top10(b.logits, 1, (int) g.n_expert, (int) k, b.ids, b.weights, stream);
+if (!route_logits(v, g, k, b.logits, b.ids, b.weights, stream, err)) return false;
 // ---- THE DOORBELL, AND IT IS THE WHOLE POINT OF THE PROTOCOL.  The routed experts' INPUT (`x`) and the
 //      miss list (`ids`, `weights`) are published to the host HERE, before anything that depends on them,
 //      so a CPU pool can start on them while the GPU keeps working.  Both the copy and the ring are
@@ -383,6 +389,34 @@ if (db != nullptr && g_publish_kernel) {
 // write idempotent across replays of the same graph - a captured literal would ring the same number
 // forever and the host would never see a change.
 strata::kernels::doorbell_ring(db->d_seq, stream);    }    return true;}
+bool moe_route_rows(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t k, const MoEBuffers& b,
+                    const float* x, int n, int64_t logits_stride, void* stream, std::string& err) {
+    if (!native_bf16_projections) {
+        for (int t = 0; t < n; ++t) {
+            MoEBuffers bt = b;
+            bt.logits = b.logits + t * logits_stride;
+            bt.ids = b.ids + t * k;
+            bt.weights = b.weights + t * k;
+            if (!moe_route(tables, g, layer, k, bt, x + t * g.n_embd, stream, err)) return false;
+        }
+        return true;
+    }
+    const LayerView v(tables, layer);
+    const WeightRef* w_router = v.get("ffn_gate_inp.weight");
+    if (w_router == nullptr) { err = v.name("ffn_gate_inp.weight") + " is missing"; return false; }
+    if (k < 1 || k > 64) { err = "moe_route: k must be 1..64"; return false; }
+    strata::kernels::bf16_gemv_fp32_mmvf_rows(x, g.n_embd, (const uint16_t*) w_router->data, b.logits, logits_stride,
+                                             g.n_embd, g.n_expert, n, stream);
+    if (strata::kernels::native_router_enabled() && g.n_expert == 512 && k == 10) {
+        try { strata::kernels::native_router_top10_rows(b.logits, logits_stride, b.ids, b.weights, n, stream); }
+        catch (const std::exception& error) { err = v.name("router") + ": " + error.what(); return false; }
+        return true;
+    }
+    for (int t = 0; t < n; ++t)
+        if (!route_logits(v, g, k, b.logits + t * logits_stride, b.ids + t * k, b.weights + t * k, stream, err))
+            return false;
+    return true;
+}
 bool moe_shared(const WeightTable& tables, const ModelGeometry& g, int64_t layer, const MoEBuffers& b,                const float* x, void* stream, std::string& err) {    using namespace strata::kernels;    const LayerView v(tables, layer);    const WeightRef* w_ginp = v.get("ffn_gate_inp_shexp.weight");    const WeightRef* w_sgate = v.get("ffn_gate_shexp.weight");    const WeightRef* w_sup = v.get("ffn_up_shexp.weight");    const WeightRef* w_sdown = v.get("ffn_down_shexp.weight");    const char* missing = !w_ginp ? "ffn_gate_inp_shexp.weight" : !w_sgate ? "ffn_gate_shexp.weight"                          : !w_sup ? "ffn_up_shexp.weight" : !w_sdown ? "ffn_down_shexp.weight" : nullptr;    if (missing) { err = v.name(missing) + " is missing"; return false; }
 // ---- the shared expert.  Its three weights are quantized, so they need their planes.
 SForm f_gate, f_up, f_down;    if (!sform_of(*w_sgate, f_gate, v.name("ffn_gate_shexp.weight"), err)) return false;    if (!sform_of(*w_sup, f_up, v.name("ffn_up_shexp.weight"), err)) return false;    if (!sform_of(*w_sdown, f_down, v.name("ffn_down_shexp.weight"), err)) return false;    Planes p_gate, p_up, p_down;    if (!plane_ptrs(*w_sgate, v.name("ffn_gate_shexp.weight"), p_gate, err)) return false;    if (!plane_ptrs(*w_sup, v.name("ffn_up_shexp.weight"), p_up, err)) return false;    if (!plane_ptrs(*w_sdown, v.name("ffn_down_shexp.weight"), p_down, err)) return false;
@@ -435,6 +469,27 @@ try {
     return false;
 }
 return true;}
+bool moe_combine_parts_rows(const ModelGeometry& g, int64_t layer, int64_t k, const MoEBuffers& b, const float* parts,
+                            float* out, int n, void* stream, std::string& err) {
+    if (!strata::kernels::native_moe_combine_enabled()) {
+        for (int t = 0; t < n; ++t) {
+            MoEBuffers bt = b;
+            bt.weights = b.weights + t * k;
+            bt.shared = b.shared ? b.shared + t * g.n_embd : nullptr;
+            if (!moe_combine_parts(g, layer, k, bt, parts + t * k * g.n_embd, out + t * g.n_embd, stream, err))
+                return false;
+        }
+        return true;
+    }
+    if (k < 1 || k > 64) { err = "moe_finish: k must be 1..64"; return false; }
+    try {
+        strata::kernels::native_moe_combine_rows(parts, b.weights, b.shared, out, g.n_embd, k, n, stream);
+    } catch (const std::exception& error) {
+        err = "blk." + std::to_string(layer) + ".moe_combine" + ": " + error.what();
+        return false;
+    }
+    return true;
+}
 bool moe_finish(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t k, const MoEBuffers& b,
                 const float* x, const float* parts, float* out, void* stream, std::string& err) {
     if (k < 1 || k > 64) { err = "moe_finish: k must be 1..64"; return false; }

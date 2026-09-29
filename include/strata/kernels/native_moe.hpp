@@ -15,4 +15,8 @@ bool native_moe_combine_enabled();
 // Requires a nonnull ordered stream and disjoint output. No allocation or sync.
 void native_moe_combine(const float* parts, const float* weights, const float* shared,
                         float* output, int64_t n_embd, int64_t k, void* stream);
+// The same for `n` consecutive tokens in one launch: token t's parts at parts + t * k * n_embd, weights at
+// weights + t * k, shared and output at + t * n_embd; each token's result equals a one-token call.
+void native_moe_combine_rows(const float* parts, const float* weights, const float* shared,
+                             float* output, int64_t n_embd, int64_t k, int n, void* stream);
 }
