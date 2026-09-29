@@ -74,13 +74,16 @@ constexpr int STAGE = 8;           // host->device expert staging ring (chunks b
 constexpr int RING_MAX = 512;           // the arrays; the ring itself is ring_slots()
 constexpr int64_t STREAM_ALL_MIN = 2048;
 double g_pinned_share = 1.0;
-// The streamed ring: 384 slots when (nearly) every streamed expert is DMA'd from pinned RAM - measured on Q2_0,
-// 8192-token chunks: 96 slots 1153 tok/s, 384 1294 (the next layer's experts arrive during its attention half) -
+// The streamed ring: 384 slots at 8192-token chunks when (nearly) every streamed expert is DMA'd from pinned RAM -
+// measured on Q2_0: 96 slots 1153 tok/s, 384 1294 (the next layer's experts arrive during its attention half) -
 // and 96 when a large share goes through host copies (IQ3_S on 64 GB, a third unpinned: 96 slots 1216, 256 1070 -
-// the host copies are the limit and the bigger ring only takes cache slots).  STRATA_PREFILL_RING overrides.
+// the host copies are the limit and the bigger ring only takes cache slots).  The attention half, and so the ring
+// it needs, scales with the chunk: 384 * T / 8192, at least 96 (IQ3_XXS on two GPUs, one on a x4 link: 6.8K prompt
+// in 3584-token chunks, 384 slots 7.58 / 7.62 s, 128 7.37 / 7.36 s).  STRATA_PREFILL_RING overrides.
 inline int ring_slots(size_t T) {
     const char* v = std::getenv("STRATA_PREFILL_RING");
-    const int r = v ? std::atoi(v) : (g_pinned_share >= 0.9 ? 384 : 96);
+    const int r = v ? std::atoi(v)
+                    : g_pinned_share >= 0.9 ? (int) std::max<int64_t>(96, 384 * (int64_t) T / 8192) : 96;
     const int big = r < 16 ? 16 : r > RING_MAX ? RING_MAX : r;
     return (int64_t) T >= STREAM_ALL_MIN ? big : STAGE;
 }
