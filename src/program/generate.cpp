@@ -2961,10 +2961,11 @@ int main(int argc, char** argv) {
             hold_next = end + o.prompt_cache_every;
             return true;
         };
-        sp.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
+        sp.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, void* scratch, size_t scratch_bytes,
+                          std::string& e) -> bool {
             std::vector<int32_t> nxt((size_t) T);
             for (int64_t t = 0; t < T; ++t) nxt[(size_t) t] = (int32_t) cur[(size_t) (p0 + t + 1)];
-            if (!mtp.prefill(R_rows, nxt.data(), T, p0, e)) return false;
+            if (!mtp.prefill(R_rows, nxt.data(), T, p0, e, scratch, scratch_bytes)) return false;
             // progress for the server window: PP <position reached> <prompt tokens> <ms> <fresh tokens/s>
             const int64_t done = p0 + T;
             const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
@@ -3913,11 +3914,12 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;
             }
-            prefill.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
+            prefill.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, void* scratch, size_t scratch_bytes,
+                                   std::string& e) -> bool {
                 // cell i pairs R_i with the token at i + 1 (every such token is in the prompt)
                 std::vector<int32_t> nxt((size_t) T);
                 for (int64_t t = 0; t < T; ++t) nxt[(size_t) t] = (int32_t) o.tokens[(size_t) (p0 + t + 1)];
-                return mtp.prefill(R_rows, nxt.data(), T, p0, e);
+                return mtp.prefill(R_rows, nxt.data(), T, p0, e, scratch, scratch_bytes);
             };
         }
         const Clock::time_point tp0 = Clock::now();

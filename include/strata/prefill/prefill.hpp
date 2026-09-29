@@ -79,7 +79,9 @@ public:
     /// stage's GPU, T x hc*n_embd, valid until the next chunk) and the chunk's first position; the MTP draft layer
     /// builds its K/V from them.  The last stage's stream is synchronized before the call, which comes from that
     /// stage's thread: with more than one GPU the stages before it may be working on the next chunk.
-    std::function<bool(const float* R_rows, int64_t T, int64_t pos0, std::string& err)> on_chunk;
+    /// `scratch`: that GPU's attention/MoE scratch region (`scratch_bytes`), idle until the callback returns.
+    std::function<bool(const float* R_rows, int64_t T, int64_t pos0, void* scratch, size_t scratch_bytes,
+                       std::string& err)> on_chunk;
 
     /// With more than one GPU: asked, in order, for the end position of every chunk; true = the first stage waits
     /// until every stage has finished that chunk and `on_chunk` returned (where the callback reads every layer's

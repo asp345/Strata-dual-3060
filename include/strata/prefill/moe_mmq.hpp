@@ -12,7 +12,7 @@ namespace strata::prefill::mmq {
 
 /// This build has the MMQ path (the ggml sources were available to the build).
 bool built();
-/// MMQ covers this ggml type (the i-quants and Q2_0 the packs use; IQ1_M is not covered).
+/// MMQ covers this ggml type (the i-quants and Q2_0 the packs use, Q8_0 the MTP draft layer's; IQ1_M is not covered).
 bool supported(int ggml_type);
 /// Bytes of one expert's gate+up ([2*n_ff, n_embd]) or down ([n_embd, n_ff]) weights in `ggml_type`.
 size_t matrix_bytes(int ggml_type, int64_t rows, int64_t cols);
@@ -50,6 +50,11 @@ public:
     Context(const Context&) = delete;
     Context& operator=(const Context&) = delete;
     void run(const Product& p, void* stream);
+    /// A dense product: dst[rows, w_rows] (`ld_dst` floats apart) = the `rows` q8_1 rows of `xq` times W[w_rows,
+    /// w_cols]^T, as one expert over every row.  `ids`: the identity row map (>= rows entries); `bounds`: 2 ints of
+    /// device memory for the expert's row range.
+    void dense(const void* w, int type, int64_t w_rows, int64_t w_cols, const void* xq, int64_t rows, const int32_t* ids,
+               int32_t* bounds, float* dst, int64_t ld_dst, void* stream);
 
 private:
     void* ctx_ = nullptr;

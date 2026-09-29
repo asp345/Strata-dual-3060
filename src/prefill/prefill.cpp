@@ -1509,7 +1509,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     err = std::string("prefill: ") + cudaGetErrorString(cudaGetLastError());
                     return false;
                 }
-                if (!on_chunk(m.R, T, p0, err)) return false;
+                if (!on_chunk(m.R, T, p0, m.region, (size_t) m.region_bytes, err)) return false;
             }
             signal(done, pi, k + 1);
             if (pi == 0) hold = false;

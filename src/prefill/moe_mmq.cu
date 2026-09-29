@@ -83,6 +83,7 @@ __global__ void iota_kernel(int32_t* dst, int64_t n) {
     if (i < n) dst[i] = (int32_t) i;
 }
 
+__global__ void bounds_kernel(int32_t* b, int32_t rows) { b[0] = 0; b[1] = rows; }
 unsigned blocks(int64_t n) { return (unsigned) ((n + 255) / 256); }
 
 }  // namespace
@@ -91,7 +92,7 @@ bool built() { return true; }
 
 bool supported(int t) {
     switch ((ggml_type) t) {
-        case GGML_TYPE_Q2_0: case GGML_TYPE_IQ2_XXS: case GGML_TYPE_IQ2_XS: case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_Q2_0: case GGML_TYPE_Q8_0: case GGML_TYPE_IQ2_XXS: case GGML_TYPE_IQ2_XS: case GGML_TYPE_IQ2_S:
         case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ3_S: case GGML_TYPE_IQ4_NL: case GGML_TYPE_IQ4_XS:
             return true;
         default:
@@ -134,6 +135,7 @@ void Context::run(const Product& p, void* stream) {
     const cudaStream_t s = (cudaStream_t) stream;
     switch (t) {
         case GGML_TYPE_Q2_0: mul_mat_q_case<GGML_TYPE_Q2_0>(ctx, a, s); break;
+        case GGML_TYPE_Q8_0: mul_mat_q_case<GGML_TYPE_Q8_0>(ctx, a, s); break;
         case GGML_TYPE_IQ2_XXS: mul_mat_q_case<GGML_TYPE_IQ2_XXS>(ctx, a, s); break;
         case GGML_TYPE_IQ2_XS: mul_mat_q_case<GGML_TYPE_IQ2_XS>(ctx, a, s); break;
         case GGML_TYPE_IQ2_S: mul_mat_q_case<GGML_TYPE_IQ2_S>(ctx, a, s); break;
@@ -146,6 +148,17 @@ void Context::run(const Product& p, void* stream) {
             std::exit(1);
     }
     ck(cudaGetLastError(), "mul_mat_q");
+}
+
+void Context::dense(const void* w, int type, int64_t w_rows, int64_t w_cols, const void* xq, int64_t rows,
+                    const int32_t* ids, int32_t* bounds, float* dst, int64_t ld_dst, void* stream) {
+    if (rows <= 0) return;
+    bounds_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(bounds, (int32_t) rows);
+    Product p;
+    p.w = w; p.type = type; p.w_rows = w_rows; p.w_cols = w_cols; p.expert_bytes = matrix_bytes(type, w_rows, w_cols);
+    p.n = 1; p.xq = xq; p.bounds = bounds; p.ids = ids; p.total_rows = rows; p.max_rows = rows;
+    p.dst = dst; p.ld_dst = ld_dst;
+    run(p, stream);
 }
 
 void gather_native(const void* gate, const void* up, size_t gu_half_bytes, const void* down, size_t d_bytes,
