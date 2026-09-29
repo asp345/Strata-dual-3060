@@ -12,13 +12,15 @@
 namespace strata::prefill {
 
 // ---- hyper-connection (n_embd 2560, hc 4, hc_lr 320)
-/// xn[t, c*2560 + d] = R[t,c,d] * rsqrt(mean_d R[t,c,:]^2 + eps) * w_norm[c*2560 + d]; also its BF16 image.
-void gr_norm(const float* R, const float* w_norm, float eps, float* xn, uint16_t* xn16, int64_t T, void* stream);
+/// xn[t, c*2560 + d] = R[t,c,d] * rs[t*4 + c] * w_norm[c*2560 + d], rs = rsqrt(mean_d R[t,c,:]^2 + eps): the BF16
+/// image of xn, and rs per row.
+void gr_norm(const float* R, const float* w_norm, float eps, float* row_rs, uint16_t* xn16, int64_t T, void* stream);
 /// lo16[t, k] = bf16(silu(lo[t, k] / hc))
 void gr_silu(const float* lo, uint16_t* lo16, int64_t T, void* stream);
-/// mixed[t, d] = mean_c xn[t, c, d] * sigmoid(gated[t, c, d]); FP32, BF16 and FP16 (either image may be null).
-void gr_mix(const float* xn, const float* gated, float* mixed, uint16_t* mixed16, int64_t T, void* stream,
-            uint16_t* mixed_h = nullptr);
+/// mixed[t, d] = mean_c xn[t, c, d] * sigmoid(gated[t, c, d]), xn recomputed from R, w_norm and gr_norm's rs;
+/// FP32, BF16 and FP16 (either image may be null).
+void gr_mix(const float* R, const float* w_norm, const float* row_rs, const float* gated, float* mixed, uint16_t* mixed16,
+            int64_t T, void* stream, uint16_t* mixed_h = nullptr);
 /// R[t, c, d] += bo[t, d] * 2 sigmoid(inj[t, c] / hc)   (inj has row stride inj_ld)
 void gr_write(float* R, const float* bo, const float* inj, int64_t inj_ld, int64_t T, void* stream);
 /// R[t, c, :] = e[t, :] for all four streams (the embedding broadcast).

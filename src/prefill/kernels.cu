@@ -56,7 +56,7 @@ unsigned blocks_for(int64_t n, int t = 256) { return (unsigned) ((n + t - 1) / t
 
 // ---------------------------------------------------------------- hyper-connection
 __global__ void gr_norm_kernel(const float* __restrict__ R, const float* __restrict__ w, float eps,
-                               float* __restrict__ xn, uint16_t* __restrict__ xn16) {
+                               float* __restrict__ row_rs, uint16_t* __restrict__ xn16) {
     __shared__ float sh[32];
     const int64_t row = blockIdx.x;                 // t * 4 + c
     const int c = (int) (row % HC);
@@ -64,11 +64,8 @@ __global__ void gr_norm_kernel(const float* __restrict__ R, const float* __restr
     float ss = 0.0f;
     for (int d = threadIdx.x; d < N; d += blockDim.x) ss += r[d] * r[d];
     const float rs = rsqrtf(block_sum(ss, sh) / (float) N + eps);
-    for (int d = threadIdx.x; d < N; d += blockDim.x) {
-        const float v = r[d] * rs * w[c * N + d];
-        xn[row * N + d] = v;
-        xn16[row * N + d] = bf(v);
-    }
+    if (threadIdx.x == 0) row_rs[row] = rs;
+    for (int d = threadIdx.x; d < N; d += blockDim.x) xn16[row * N + d] = bf(r[d] * rs * w[c * N + d]);
 }
 __global__ void gr_silu_kernel(const float* __restrict__ lo, uint16_t* __restrict__ lo16, int64_t n) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -76,8 +73,9 @@ __global__ void gr_silu_kernel(const float* __restrict__ lo, uint16_t* __restric
     const float x = lo[i] / (float) HC;
     lo16[i] = bf(x / (1.0f + __expf(-x)));
 }
-__global__ void gr_mix_kernel(const float* __restrict__ xn, const float* __restrict__ g, float* __restrict__ mixed,
-                              uint16_t* __restrict__ mixed16, int64_t T, uint16_t* __restrict__ mixed_h) {
+__global__ void gr_mix_kernel(const float* __restrict__ R, const float* __restrict__ w, const float* __restrict__ row_rs,
+                              const float* __restrict__ g, float* __restrict__ mixed, uint16_t* __restrict__ mixed16,
+                              int64_t T, uint16_t* __restrict__ mixed_h) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= T * N) return;
     const int64_t t = i / N, d = i % N;
@@ -85,7 +83,8 @@ __global__ void gr_mix_kernel(const float* __restrict__ xn, const float* __restr
 #pragma unroll
     for (int c = 0; c < HC; ++c) {
         const int64_t j = t * D + c * N + d;
-        s = fmaf(xn[j], sigm(g[j]), s);
+        const float xn = R[j] * row_rs[t * HC + c] * w[c * N + d];   // gr_norm's value
+        s = fmaf(xn, sigm(g[j]), s);
     }
     s /= (float) HC;
     mixed[i] = s;
@@ -470,17 +469,18 @@ void to_bf16(const float* x, uint16_t* y, int64_t n, void* stream) {
     check("to_bf16");
 }
 
-void gr_norm(const float* R, const float* w_norm, float eps, float* xn, uint16_t* xn16, int64_t T, void* stream) {
-    gr_norm_kernel<<<(unsigned) (T * HC), 256, 0, (cudaStream_t) stream>>>(R, w_norm, eps, xn, xn16);
+void gr_norm(const float* R, const float* w_norm, float eps, float* row_rs, uint16_t* xn16, int64_t T, void* stream) {
+    gr_norm_kernel<<<(unsigned) (T * HC), 256, 0, (cudaStream_t) stream>>>(R, w_norm, eps, row_rs, xn16);
     check("gr_norm");
 }
 void gr_silu(const float* lo, uint16_t* lo16, int64_t T, void* stream) {
     gr_silu_kernel<<<blocks_for(T * LR), 256, 0, (cudaStream_t) stream>>>(lo, lo16, T * LR);
     check("gr_silu");
 }
-void gr_mix(const float* xn, const float* gated, float* mixed, uint16_t* mixed16, int64_t T, void* stream,
-            uint16_t* mixed_h) {
-    gr_mix_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(xn, gated, mixed, mixed16, T, mixed_h);
+void gr_mix(const float* R, const float* w_norm, const float* row_rs, const float* gated, float* mixed, uint16_t* mixed16,
+            int64_t T, void* stream, uint16_t* mixed_h) {
+    gr_mix_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(R, w_norm, row_rs, gated, mixed, mixed16, T,
+                                                                         mixed_h);
     check("gr_mix");
 }
 void gr_write(float* R, const float* bo, const float* inj, int64_t inj_ld, int64_t T, void* stream) {

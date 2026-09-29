@@ -250,7 +250,7 @@ struct Prefill::Impl {
     Gemm gemm;
     std::vector<void*> owned;
     // chunk buffers
-    float *emb = nullptr, *R = nullptr, *xn = nullptr, *lo = nullptr, *gated = nullptr, *inj = nullptr;
+    float *emb = nullptr, *R = nullptr, *row_rs = nullptr, *lo = nullptr, *gated = nullptr, *inj = nullptr;
     uint16_t *xn16 = nullptr, *lo16 = nullptr;
     float* mixed = nullptr;
     uint16_t *mixed_bf = nullptr, *mixed_h = nullptr;
@@ -544,7 +544,7 @@ bool Prefill::carve(Impl& m, size_t T, void* alloc) {
     const core::ModelGeometry& g = *m.g;
     core::SessionState& ss = *m.ss;
     bool ok = true;
-    m.emb = o.take<float>(T * N, ok); m.R = o.take<float>(T * D, ok); m.xn = o.take<float>(T * D, ok);
+    m.emb = o.take<float>(T * N, ok); m.R = o.take<float>(T * D, ok); m.row_rs = o.take<float>(T * HC, ok);
     m.xn16 = o.take<uint16_t>(T * D, ok); m.lo = o.take<float>(T * LR, ok); m.lo16 = o.take<uint16_t>(T * LR, ok);
     m.gated = o.take<float>(T * D, ok); m.inj = o.take<float>(T * HC, ok);
     m.mixed = o.take<float>(T * N, ok); m.mixed_bf = o.take<uint16_t>(T * N, ok);
@@ -659,7 +659,7 @@ uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::Session
     o.take<uint16_t>((size_t) GEMM_SCRATCH, ok);
     o.take<uint8_t>(GEMM_WS, ok);
     auto f = [&](size_t n) { o.take<float>(n, ok); };
-    f(T * N); f(T * D); f(T * D); o.take<uint16_t>(T * D, ok); f(T * LR); o.take<uint16_t>(T * LR, ok);
+    f(T * N); f(T * D); f(T * HC); o.take<uint16_t>(T * D, ok); f(T * LR); o.take<uint16_t>(T * LR, ok);
     f(T * D); f(T * HC); f(T * N); o.take<uint16_t>(T * N, ok); o.take<uint16_t>(T * N, ok); f(T * N);
     o.take<int32_t>(T * strata::kernels::kStepCount, ok);
     strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
@@ -1054,12 +1054,12 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                           *wu = need(v, su.c_str(), err), *wi = need(v, si.c_str(), err);
                     if (!wn || !wd || !wu || !wi) return false;
                     pt.mark(kPfHc, cs);
-                    gr_norm(m.R, (const float*) wn->data, EPS, m.xn, m.xn16, T, m.cs);
+                    gr_norm(m.R, (const float*) wn->data, EPS, m.row_rs, m.xn16, T, m.cs);
                     if (!bf16_proj(m.gemm, wd, m.xn16, m.lo, T, sd, err)) return false;
                     gr_silu(m.lo, m.lo16, T, m.cs);
                     if (!bf16_proj(m.gemm, wu, m.lo16, m.gated, T, su, err)) return false;
                     if (!bf16_proj(m.gemm, wi, m.xn16, m.inj, T, si, err)) return false;
-                    gr_mix(m.xn, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h);
+                    gr_mix(m.R, (const float*) wn->data, m.row_rs, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h);
 
                     if (half == 0 && !core::is_qsa_layer(g, l)) {
                         // ======================= GDN =======================
