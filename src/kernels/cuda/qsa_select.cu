@@ -50,6 +50,95 @@ __global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_kernel(const fl
     }
 }
 
+// qsa_block_scores for many queries (a prompt's): a tile of ST_Q queries x ST_B blocks per thread block, the query and
+// key slices staged in shared memory (dimension-major, so a warp's reads do not collide) and each thread's 4 x 8
+// dot products kept in registers - no shuffles.  The dots are summed in dimension order, so a score can differ from
+// the warp kernel's in the last bits.  Blocks past a query's n_bid are not written; n_bid itself is written by
+// block_scores_dead_kernel.
+constexpr int ST_Q = 128, ST_B = 128, ST_D = 32;
+__global__ void __launch_bounds__(256) block_scores_tiled_kernel(const float* __restrict__ pooled,
+                                                                 const float* __restrict__ q_idx,
+                                                                 const int32_t* __restrict__ steps, int64_t nq,
+                                                                 int64_t max_blocks, float* __restrict__ out) {
+    __shared__ __align__(16) float qs[ST_D][ST_Q];
+    __shared__ __align__(16) float ks[ST_D][ST_B];
+    const int64_t q0 = (int64_t) blockIdx.y * ST_Q, b0 = (int64_t) blockIdx.x * ST_B;
+    const int64_t q_last = min(q0 + ST_Q, nq) - 1;
+    const int64_t nb_hi = steps[q_last * kStepCount + kStepNBid];   // the tile's largest n_bid (positions ascend)
+    if (b0 >= nb_hi) return;
+    const int t = threadIdx.x, tx = t & 15, ty = t >> 4;         // 16 x 16 threads, each 8 blocks x 8 queries
+    float score[8][8] = {};
+    for (int h = 0; h < IDX_HEADS; ++h) {
+        float acc[8][8] = {};
+        for (int d0 = 0; d0 < IDX_DIM; d0 += ST_D) {
+            __syncthreads();
+            for (int i = t; i < ST_Q * ST_D; i += 256) {
+                const int qq = i / ST_D, dd = i % ST_D;
+                const int64_t q = q0 + qq;
+                qs[dd][qq] = q < nq ? q_idx[(q * IDX_HEADS + h) * IDX_DIM + d0 + dd] : 0.0f;
+            }
+            for (int i = t; i < ST_B * ST_D; i += 256) {
+                const int bb = i / ST_D, dd = i % ST_D;
+                const int64_t b = b0 + bb;
+                ks[dd][bb] = b < nb_hi ? pooled[b * IDX_DIM + d0 + dd] : 0.0f;
+            }
+            __syncthreads();
+#pragma unroll 8
+            for (int dd = 0; dd < ST_D; ++dd) {
+                const float4 qv = *reinterpret_cast<const float4*>(&qs[dd][ty * 4]);
+                const float4 qw = *reinterpret_cast<const float4*>(&qs[dd][64 + ty * 4]);
+                const float4 kv = *reinterpret_cast<const float4*>(&ks[dd][tx * 4]);
+                const float4 kw = *reinterpret_cast<const float4*>(&ks[dd][64 + tx * 4]);
+                const float qa[8] = {qv.x, qv.y, qv.z, qv.w, qw.x, qw.y, qw.z, qw.w};
+                const float ka[8] = {kv.x, kv.y, kv.z, kv.w, kw.x, kw.y, kw.z, kw.w};
+#pragma unroll
+                for (int i = 0; i < 8; ++i)
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) acc[i][j] = fmaf(qa[i], ka[j], acc[i][j]);
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < 8; ++i)
+#pragma unroll
+            for (int j = 0; j < 8; ++j) score[i][j] += acc[i][j] > 0.0f ? acc[i][j] : 0.0f;
+    }
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int64_t q = q0 + (i < 4 ? ty * 4 + i : 64 + ty * 4 + i - 4);
+        if (q >= nq) continue;
+        const int64_t n_bid = steps[q * kStepCount + kStepNBid];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int64_t b = b0 + (j < 4 ? tx * 4 + j : 64 + tx * 4 + j - 4);
+            if (b < n_bid && b < max_blocks) out[q * max_blocks + b] = score[i][j];
+        }
+    }
+}
+
+// a query's tail block n_bid: the `dead` key, +1e9 when the block has cells (as block_scores_kernel)
+__global__ void __launch_bounds__(32) block_scores_dead_kernel(const float* __restrict__ dead,
+                                                               const float* __restrict__ q_idx,
+                                                               const int32_t* __restrict__ steps, int64_t max_blocks,
+                                                               float* __restrict__ out) {
+    const int64_t qi = blockIdx.x;
+    const int32_t* st = steps + qi * kStepCount;
+    const int64_t n_kv = st[kStepNKv], n_bid = st[kStepNBid];
+    if (n_bid >= max_blocks) return;
+    const int lane = threadIdx.x;
+    const float4 k4 = *reinterpret_cast<const float4*>(dead + lane * 4);
+    const float* q = q_idx + qi * IDX_HEADS * IDX_DIM + lane * 4;
+    float score = 0.0f;
+#pragma unroll
+    for (int h = 0; h < IDX_HEADS; ++h) {
+        const float4 q4 = *reinterpret_cast<const float4*>(q + h * IDX_DIM);
+        float d = k4.x * q4.x + k4.y * q4.y + k4.z * q4.z + k4.w * q4.w;
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) d += __shfl_xor_sync(0xffffffffu, d, o);
+        score += d > 0.0f ? d : 0.0f;
+    }
+    if (lane == 0) out[qi * max_blocks + n_bid] = score + (n_kv % R != 0 ? 1e9f : 0.0f);
+}
+
 __global__ void __launch_bounds__(TOPK_T) block_topk_kernel(const float* __restrict__ scores,
                                                             const int32_t* __restrict__ steps, int64_t max_blocks,
                                                             int64_t cap, int32_t* __restrict__ ids) {
@@ -162,6 +251,20 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
                                                                               scores);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores: %s\n", cudaGetErrorString(e)); std::exit(1); }
+}
+
+void qsa_block_scores_tiled(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps, int64_t nq,
+                            int64_t max_blocks, const QsaShapes& s, float* scores, void* stream) {
+    if (nq <= 0) return;
+    if (s.idx_dim != IDX_DIM || s.idx_n_head != IDX_HEADS || s.idx_block != R || (nq + ST_Q - 1) / ST_Q > 65535) {
+        std::fprintf(stderr, "qsa_block_scores_tiled: unsupported indexer geometry\n");
+        std::exit(1);
+    }
+    const dim3 grid((unsigned) ((max_blocks + ST_B - 1) / ST_B), (unsigned) ((nq + ST_Q - 1) / ST_Q));
+    block_scores_tiled_kernel<<<grid, 256, 0, (cudaStream_t) stream>>>(pooled, q_idx, steps, nq, max_blocks, scores);
+    block_scores_dead_kernel<<<(unsigned) nq, 32, 0, (cudaStream_t) stream>>>(dead, q_idx, steps, max_blocks, scores);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores_tiled: %s\n", cudaGetErrorString(e)); std::exit(1); }
 }
 
 void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,

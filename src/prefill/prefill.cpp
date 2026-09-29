@@ -1099,8 +1099,8 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         for (int64_t t0 = 0; t0 < T; t0 += m.sel_batch) {
                             const int64_t nb = std::min(m.sel_batch, T - t0);
                             const int32_t* steps0 = m.steps_dev + t0 * strata::kernels::kStepCount;
-                            strata::kernels::qsa_block_scores(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512, steps0, nb,
-                                                              m.max_blocks, s, m.sel_scores, m.cs);
+                            strata::kernels::qsa_block_scores_tiled(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512, steps0,
+                                                                    nb, m.max_blocks, s, m.sel_scores, m.cs);
                             strata::kernels::qsa_block_topk(m.sel_scores, steps0, nb, m.max_blocks, m.cap, s,
                                                             m.sel_ids + t0 * m.cap, m.cs);
                         }
@@ -1126,8 +1126,8 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             for (int64_t t0 = 0; t0 < T; t0 += m.sel_batch) {
                                 const int64_t nb = std::min(m.sel_batch, T - t0);
                                 const int32_t* steps0 = m.steps_dev + t0 * strata::kernels::kStepCount;
-                                strata::kernels::qsa_block_scores(pooled16, dead16, m.q_idx + t0 * 512, steps0, nb,
-                                                                  m.max_blocks, s, m.sel_scores, m.cs);
+                                strata::kernels::qsa_block_scores_tiled(pooled16, dead16, m.q_idx + t0 * 512, steps0, nb,
+                                                                        m.max_blocks, s, m.sel_scores, m.cs);
                                 strata::kernels::qsa_block_topk(m.sel_scores, steps0, nb, m.max_blocks, m.cap, s,
                                                                 ids16 + t0 * m.cap, m.cs);
                             }

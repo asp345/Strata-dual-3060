@@ -26,6 +26,11 @@ namespace strata::kernels {
 void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps, int64_t nq,
                       int64_t max_blocks, const QsaShapes& s, float* scores, void* stream);
 
+/// The same scores for many queries (a prompt's), from shared-memory tiles instead of a warp per (query, block): the
+/// dots are summed in another order, so a score can differ from qsa_block_scores' in the last bits.
+void qsa_block_scores_tiled(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps,
+                            int64_t nq, int64_t max_blocks, const QsaShapes& s, float* scores, void* stream);
+
 /// ids [nq, cap] (cells, ascending); `cap` >= the largest selection width.
 void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
                     const QsaShapes& s, int32_t* ids, void* stream);
