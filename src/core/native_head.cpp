@@ -74,12 +74,8 @@ bool NativeHead::run(const float* mixed, float* logits, void* stream, std::strin
         return false;
     }
     try {
-        if (type_ == 13) {
-            strata::kernels::native_q5_k_f32(weights_, mixed, scratch_, logits, n_in_, n_out_, 1, stream);
-        } else {
-            strata::kernels::native_quantize_q8_1(mixed, scratch_, n_in_, 1, stream);
-            strata::kernels::native_mmvq(type_, weights_, scratch_, logits, n_in_, n_out_, 1, stream);
-        }
+        strata::kernels::native_quantize_q8_1(mixed, scratch_, n_in_, 1, stream);
+        strata::kernels::native_mmvq(type_, weights_, scratch_, logits, n_in_, n_out_, 1, stream);
     } catch (const std::exception& error) {
         err = std::string("native head launch: ") + error.what();
         return false;

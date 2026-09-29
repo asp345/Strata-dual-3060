@@ -122,6 +122,8 @@ private:
         int64_t l0 = 0, l1 = 0, gdn0 = 0, qsa0 = 0, n_gdn = 0, n_qsa = 0;
         cudaStream_t cs = nullptr;
         cudaStream_t copy = nullptr;                              // the copy engine's stream (DMA of missed experts)
+        cudaStream_t side = nullptr;                              // the PCIe share's copy kernel, beside the VRAM experts
+        cudaEvent_t fork = nullptr, join = nullptr;
         cudaGraphExec_t exec[9] = {};
         cudaGraphExec_t commit_exec = nullptr;
         void* arena = nullptr;

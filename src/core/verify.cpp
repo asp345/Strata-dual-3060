@@ -123,6 +123,9 @@ Verifier::~Verifier() {
         if (P.commit_exec) cudaGraphExecDestroy(P.commit_exec);
         if (P.cs) cudaStreamDestroy(P.cs);
         if (P.copy) { cudaStreamSynchronize(P.copy); cudaStreamDestroy(P.copy); }
+        if (P.side) cudaStreamDestroy(P.side);
+        if (P.fork) cudaEventDestroy(P.fork);
+        if (P.join) cudaEventDestroy(P.join);
         if (P.arena) cudaFree(P.arena);
     }
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_,
@@ -304,7 +307,10 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         carve(P, real);
         total += count.used;
         if (cudaStreamCreateWithFlags(&P.copy, cudaStreamNonBlocking) != cudaSuccess ||
-            cudaStreamCreateWithFlags(&P.cs, cudaStreamNonBlocking) != cudaSuccess) {
+            cudaStreamCreateWithFlags(&P.cs, cudaStreamNonBlocking) != cudaSuccess ||
+            cudaStreamCreateWithFlags(&P.side, cudaStreamNonBlocking) != cudaSuccess ||
+            cudaEventCreateWithFlags(&P.fork, cudaEventDisableTiming) != cudaSuccess ||
+            cudaEventCreateWithFlags(&P.join, cudaEventDisableTiming) != cudaSuccess) {
             err = "verify: stream create failed";
             return false;
         }
@@ -634,13 +640,22 @@ bool Verifier::record_window(int T, Part& P, std::string& err) {
                                P.hit_xs_ + (size_t) tb * (N / 32), P.hit_scratch_, hit_out, cs);
             }
         };
-        grouped(p_ptr, p_start, p_counts);
-        wait_flag_ge(m_flagB_, ring, cs);                      // the PCIe share is in staging (DMA) or mapped
-        if (sink_.pcie_mode == 2) {                            // stage it with a copy kernel, then point at staging
+        if (sink_.pcie_mode == 2) {
+            // the PCIe share: a copy kernel stages it on the side stream while the VRAM experts run, then the pointers
+            // are rebased to staging
             const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
             uint8_t* stage = P.staging_ + (size_t) (grp * per) * lay.max_blob;
-            fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, cs);
-            rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), cs);
+            cudaEventRecord(P.fork, cs);
+            cudaStreamWaitEvent(P.side, P.fork, 0);
+            wait_flag_ge(m_flagB_, ring, P.side);
+            fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, P.side);
+            rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), P.side);
+            cudaEventRecord(P.join, P.side);
+            grouped(p_ptr, p_start, p_counts);
+            cudaStreamWaitEvent(cs, P.join, 0);
+        } else {
+            grouped(p_ptr, p_start, p_counts);
+            wait_flag_ge(m_flagB_, ring, cs);                  // the PCIe share is in staging (DMA) or mapped
         }
         grouped(p_ptr2, p_start2, p_counts + 2);
         wait_flag_ge(m_flag_, ring, cs);                       // the CPU's share is in the mapped rows
