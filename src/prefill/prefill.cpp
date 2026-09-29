@@ -16,6 +16,8 @@
 #include "strata/kernels/cvec.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/core/layer.hpp"
+#include "strata/core/native_head.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/qsa_select.hpp"
 #include "strata/prefill/gemm.hpp"
@@ -293,6 +295,8 @@ struct Prefill::Impl {
     cudaEvent_t ple_copied[2] = {};          // one runs; the event marks that buffer's upload done
     std::vector<uint32_t> ple_rows[2];
     float* ple_norm = nullptr;
+    int32_t* tok_dev = nullptr;              // the first stage: a chunk's token ids, for one embedding gather
+    std::vector<int32_t> tok_host;
     uint8_t* region = nullptr;               // the attention/MoE scratch region (idle while the PLE block runs)
     uint64_t region_bytes = 0;
     PrefillStats* stats = nullptr;
@@ -506,6 +510,11 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
                 ok = false;
             else
                 m.owned.push_back(m.ident_table);
+        }
+        if (st == 0) {
+            if (cudaMalloc((void**) &m.tok_dev, T * sizeof(int32_t)) != cudaSuccess) ok = false;
+            else m.owned.push_back(m.tok_dev);
+            m.tok_host.resize(T);
         }
         if (!ok) { err = "prefill: host buffers or events for a chunk of " + std::to_string(chunk) + " tokens"; return false; }
         Alloc o;
@@ -845,8 +854,38 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             ++pst.chunks;
             pt.mark(kPfStart, cs);
             if (pi == 0) {
-                // ---- embeddings, broadcast to the four streams
-                for (int64_t t = 0; t < T; ++t) {
+                // ---- embeddings, broadcast to the four streams: the chunk's rows in one gather (the per-token
+                // path's arithmetic); a chunk with picture rows, or a token outside the table, takes the per-token path
+                const core::NativeEmbed* nemb = core::native_embed();
+                const core::WeightRef* wemb = nemb ? nullptr : m.wt->find("token_embd.weight");
+                bool batched = nemb != nullptr ||
+                               (wemb != nullptr && !wemb->codebook_iq4nl && wemb->ne0 == g.n_embd && wemb->group_elems > 0 &&
+                                (wemb->code_bits == 2 || wemb->code_bits == 4 || wemb->code_bits == 8));
+                for (int64_t t = 0; batched && t < T; ++t) {
+                    const int64_t tok = tokens[c0 + t];
+                    if ((embd_rows && embd_rows[p0 + t]) || tok < 0 || (wemb && tok >= wemb->ne1)) batched = false;
+                    else m.tok_host[(size_t) t] = (int32_t) tok;
+                }
+                if (batched) {
+                    if (cudaMemcpyAsync(m.tok_dev, m.tok_host.data(), (size_t) T * sizeof(int32_t), cudaMemcpyHostToDevice,
+                                        m.cs) != cudaSuccess) {
+                        err = "prefill: the token id upload failed";
+                        return false;
+                    }
+                    if (nemb) {
+                        nemb->gather_dev(m.tok_dev, T, m.emb, m.cs);
+                    } else {
+                        const auto* codes = (const uint8_t*) wemb->data;
+                        const auto* scales = (const float*) (codes + wemb->codes_bytes);
+                        const auto* offsets = wemb->has_offset ? (const float*) (codes + wemb->codes_bytes + wemb->scales_bytes)
+                                                               : nullptr;
+                        strata::kernels::embedding_gather_dev(codes, scales, offsets, m.tok_dev, (int) T, wemb->ne0,
+                                                              wemb->code_bits, wemb->code_bias, wemb->group_elems,
+                                                              (uint64_t) (wemb->ne0 / (8 / wemb->code_bits)),
+                                                              (uint64_t) (wemb->ne0 / wemb->group_elems), m.emb, m.cs);
+                    }
+                }
+                for (int64_t t = 0; !batched && t < T; ++t) {
                     const float* row = embd_rows ? embd_rows[p0 + t] : nullptr;
                     if (row) {
                         if (cudaMemcpyAsync(m.emb + t * N, row, (size_t) N * 4, cudaMemcpyHostToDevice, m.cs) != cudaSuccess) {
@@ -1083,24 +1122,25 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         if (st.kv_q4) strata::kernels::fwht256_inplace_cuda(m.q, T * 24, m.cs);
                         rms_rows(m.q_idx, (const float*) wiqn->data, T * 4, 128, 128, EPS, m.cs);
                         rope(m.q_idx, T, 4, 128, 512, p0, (float) strata::kernels::qsa_freq_base(), m.cs);
-                        // the indexer appends, token by token; then scores + selection for many queries at once:
-                        // a query reads completed blocks (final once completed) and `dead` for its own tail block
+                        // the indexer appends the chunk (the end state of token-by-token appends); then scores + selection
+                        // for many queries at once: a query reads completed blocks (final once completed) and `dead` for
+                        // its own tail block
                         const strata::kernels::QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
                         pt.mark(kPfQsaIdx, cs);
-                        for (int64_t t = 0; t < T; ++t) {
-                            const int32_t* step_t = m.steps_dev + t * strata::kernels::kStepCount;
-                            try {
-                                strata::kernels::native_qsa_indexer_append(m.idx_raw + t * 128, step_t + strata::kernels::kStepPos, 0,
-                                                                           (const float*) wikn->data, EPS, ib, s, st.max_cells,
-                                                                           (float) strata::kernels::qsa_freq_base(), m.cs);
-                            } catch (const std::exception& e) { err = std::string("prefill indexer: ") + e.what(); return false; }
-                        }
+                        try {
+                            strata::kernels::native_qsa_indexer_append_batch(m.idx_raw, T, p0, 0, (const float*) wikn->data, EPS,
+                                                                             ib, s, st.max_cells,
+                                                                             (float) strata::kernels::qsa_freq_base(), m.cs);
+                        } catch (const std::exception& e) { err = std::string("prefill indexer: ") + e.what(); return false; }
                         pt.mark(kPfQsaSel, cs);
                         for (int64_t t0 = 0; t0 < T; t0 += m.sel_batch) {
                             const int64_t nb = std::min(m.sel_batch, T - t0);
                             const int32_t* steps0 = m.steps_dev + t0 * strata::kernels::kStepCount;
+                            // the grid reaches the batch's last query's n_bid (they rise with the position)
+                            const int64_t active = (int64_t) m.steps_host[(size_t) ((t0 + nb - 1) * strata::kernels::kStepCount +
+                                                                                    strata::kernels::kStepNBid)] + 1;
                             strata::kernels::qsa_block_scores_tiled(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512, steps0,
-                                                                    nb, m.max_blocks, s, m.sel_scores, m.cs);
+                                                                    nb, m.max_blocks, s, m.sel_scores, m.cs, active);
                             strata::kernels::qsa_block_topk(m.sel_scores, steps0, nb, m.max_blocks, m.cap, s,
                                                             m.sel_ids + t0 * m.cap, m.cs);
                         }
@@ -1127,7 +1167,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                 const int64_t nb = std::min(m.sel_batch, T - t0);
                                 const int32_t* steps0 = m.steps_dev + t0 * strata::kernels::kStepCount;
                                 strata::kernels::qsa_block_scores_tiled(pooled16, dead16, m.q_idx + t0 * 512, steps0, nb,
-                                                                        m.max_blocks, s, m.sel_scores, m.cs);
+                                                                        m.max_blocks, s, m.sel_scores, m.cs, m.max_blocks);
                                 strata::kernels::qsa_block_topk(m.sel_scores, steps0, nb, m.max_blocks, m.cap, s,
                                                                 ids16 + t0 * m.cap, m.cs);
                             }
