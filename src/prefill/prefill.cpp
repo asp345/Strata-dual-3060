@@ -951,10 +951,11 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             size_t issued = 0, consumed = 0;
             // The first GPU's first chunk, while the next GPU waits for it: that GPU (`helper`) computes the streamed
             // experts - their blobs cross its x16 link to its own ring, only their activations and outputs cross this
-            // GPU's link - with its idle buffers, on its stream ahead of its own first chunk.  Every layer MMQ, every
-            // streamed blob pinned (the helper DMAs them itself).
+            // GPU's link - with its idle buffers, on its stream ahead of its own first chunk.  It streams every
+            // non-resident expert, as the stream-all walk does, whatever the chunk.  Every layer MMQ, every streamed blob
+            // pinned (the helper DMAs them itself).
             Impl* helper = nullptr;
-            if (pi == 0 && k == 0 && n_parts > 1 && stream_all && parts_[1]->ring > STAGE) {
+            if (pi == 0 && k == 0 && n_parts > 1 && m.src != nullptr) {
                 bool fit = mmq_plan().any;
                 for (int64_t l = m.l0; fit && l < m.l1; ++l) {
                     fit = mmq_plan().layer[(size_t) l] != 0;
@@ -966,7 +967,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             }
             std::vector<StreamEntry> hseq;              // the helper's stream: what `seq` would hold
             size_t h_issued = 0, h_consumed = 0;
-            if (stream_all) {
+            if (stream_all || helper) {
                 seq_start.resize((size_t) g.n_layers + 1);
                 std::vector<Stager::Job> js;
                 std::vector<StreamEntry>& sq = helper ? hseq : seq;
@@ -985,7 +986,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     }
                 }
                 seq_start[(size_t) m.l1] = sq.size();
-                m.stager->start(std::move(js));
+                if (stream_all) m.stager->start(std::move(js));
             }
             // the helper's copies: entry k lands in its ring slot k % ring, issued once the entry `ring` before it is
             // consumed (the slot's `used` event recorded on the helper's stream)
@@ -1431,7 +1432,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         std::vector<int> stage_of(order.size(), -1);
                         // the unpinned ones are copied to pinned buffers by the stager's threads, in this order
                         std::vector<int> job_of(order.size(), -1);
-                        if (!stream_all) {
+                        if (!stream_all && !helper) {
                             std::vector<Stager::Job> js;
                             for (size_t j = 0; j < order.size(); ++j) {
                                 const int32_t e = order[j];
@@ -1444,7 +1445,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             }
                             m.stager->start(std::move(js));
                         }
-                        StagerDone stager_done{stream_all ? nullptr : m.stager.get()};
+                        StagerDone stager_done{stream_all || helper ? nullptr : m.stager.get()};
                         auto stage_one = [&](size_t j) -> bool {
                             const int32_t e = order[j];
                             const bool resident = m.host_res && m.slot_addr && m.host_res[(size_t) l * m.g->n_expert + e] >= 0;
@@ -1507,7 +1508,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             m.gemm.f16(m.Hh + o0 * 640, m.dq_d[q], m.Dm + o0 * N, ne, N, 640);
                             return true;
                         };
-                        if (!stream_all) {
+                        if (!stream_all && !helper) {
                             size_t staged = 0;
                             const size_t lookahead = STAGE - 1;
                             for (size_t j = 0; j < order.size(); ++j) {
