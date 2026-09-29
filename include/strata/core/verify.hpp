@@ -93,6 +93,10 @@ public:
 
     /// Keep the first `n_keep` (1..T) tokens of the last window; advances `ss.ple_prev` by them.
     bool commit(int n_keep, std::string& err);
+    /// `commit` in two halves: the commit graphs launched, then waited for - the MTP drafts in between (it reads
+    /// none of what they write).  Wait before the next `run`.
+    bool commit_launch(int n_keep, std::string& err);
+    bool commit_wait(std::string& err);
 
     /// Token t's residual after the last layer, (hc, n_embd) on the last stage's GPU, valid until the next `run`.
     const float* final_R(int t) const;

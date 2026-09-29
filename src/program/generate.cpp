@@ -3693,7 +3693,7 @@ int main(int argc, char** argv) {
                 bool adapt_ok = true;
                 if (!drive.d.usage.empty() && ((rounds + 1) % o.adapt_every) == 0)
                     adapt_thr = std::thread([&] { adapt_ok = adapt(); });
-                if (!ver.commit(a + 1, err)) {
+                if (!ver.commit_launch(a + 1, err)) {
                     if (adapt_thr.joinable()) adapt_thr.join();
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
@@ -3713,8 +3713,9 @@ int main(int argc, char** argv) {
                 }
                 std::fflush(stdout);
                 ++rounds;
-                const bool drafted = eos || produced_n >= max_new ||
-                                     mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p);
+                bool drafted = eos || produced_n >= max_new ||
+                               mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p);
+                if (drafted) drafted = ver.commit_wait(err);
                 if (adapt_thr.joinable()) adapt_thr.join();
                 if (!adapt_ok) {
                     std::printf("ERR an adaptive refill failed\n");
@@ -4385,7 +4386,7 @@ int main(int argc, char** argv) {
             bool adapt_ok = true;
             if (!drive.d.usage.empty() && ((rounds + 1) % o.adapt_every) == 0)
                 adapt_thr = std::thread([&] { adapt_ok = adapt(); });
-            if (!ver.commit(a + 1, err)) {
+            if (!ver.commit_launch(a + 1, err)) {
                 if (adapt_thr.joinable()) adapt_thr.join();
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;
@@ -4403,11 +4404,16 @@ int main(int argc, char** argv) {
             }
             if (eos) {
                 if (adapt_thr.joinable()) adapt_thr.join();
+                if (!ver.commit_wait(err)) {
+                    std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                    return 1;
+                }
                 total_ms += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
                 break;
             }
-            const bool drafted = !use_mtp || (int64_t) produced.size() >= o.max_new ||
-                                 mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) o.spec_min_p);
+            bool drafted = !use_mtp || (int64_t) produced.size() >= o.max_new ||
+                           mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) o.spec_min_p);
+            if (drafted) drafted = ver.commit_wait(err);
             if (adapt_thr.joinable()) adapt_thr.join();
             if (!adapt_ok) return 1;
             if (!drafted) {
