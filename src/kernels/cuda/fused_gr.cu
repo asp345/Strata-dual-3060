@@ -137,55 +137,112 @@ struct GrMulti {
     int T;
 };
 
-// Step 1 of `gr_down_kernel`, one block per token, same threads and reduction order: rs[t] and xn[t] to global.
-__global__ void __launch_bounds__(THREADS) gr_norm_multi_kernel(GrMulti m) {
-    __shared__ float part[WARPS][HC];
-    __shared__ float s_rs[HC];
-    const FusedGrArgs& a = m.a[blockIdx.x];
-    float* xn = m.xn + (size_t) blockIdx.x * D;
-    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
-    float gw[HC];
+// warp_sum of v[0 .. P) (P = 1, 2, 4 or 8 tokens) with the shuffles shared: in each of the first log2(P) stages a lane
+// keeps half of its tokens and trades the other half with its partner, then the single value finishes the stages.
+// Every add is the one warp_sum makes (own + partner, and a + b == b + a), so each token's sum is bit for bit
+// warp_sum's.  Each lane ends with one token's sum; token_lane(k) is a lane that holds token k's.
+template <int P>
+__device__ __forceinline__ float warp_sum_split(const float (&v)[P], int lane) {
+    constexpr int L = P == 1 ? 0 : P == 2 ? 1 : P == 4 ? 2 : 3;
+    float cur[P];
 #pragma unroll
-    for (int c = 0; c < HC; ++c) gw[c] = a.apply ? 2.0f * sigmoidf_(a.inj_prev[c] / (float) HC) : 0.0f;
-    float ss[HC] = {0.0f, 0.0f, 0.0f, 0.0f};
-    for (int i = t * 4; i < D; i += THREADS * 4) {
-        const int c = i / N, d = i - c * N;
+    for (int i = 0; i < P; ++i) cur[i] = v[i];
+#pragma unroll
+    for (int st = 0; st < L; ++st) {
+        const int o = 16 >> st;
+        const bool upper = (lane & o) != 0;
+        const int half = (P >> st) / 2;
+#pragma unroll
+        for (int i = 0; i < half; ++i) {
+            const float send = upper ? cur[i] : cur[half + i];
+            const float keep = upper ? cur[half + i] : cur[i];
+            cur[i] = keep + __shfl_xor_sync(0xffffffffu, send, o);
+        }
+    }
+    float x = cur[0];
+#pragma unroll
+    for (int o = 16 >> L; o > 0; o >>= 1) x += __shfl_xor_sync(0xffffffffu, x, o);
+    return x;
+}
+// the lane that holds token k's sum after warp_sum_split<P>
+template <int P>
+__device__ __forceinline__ int token_lane(int k) {
+    constexpr int L = P == 1 ? 0 : P == 2 ? 1 : P == 4 ? 2 : 3;
+    int src = 0;
+#pragma unroll
+    for (int st = 0; st < L; ++st) src |= ((k >> (L - 1 - st)) & 1) << (4 - st);
+    return src;
+}
+// token `lane`'s warp sum in lane `lane` (lanes >= T get an unused value)
+template <int P>
+__device__ __forceinline__ float warp_sums_to_lanes(const float (&v)[P], int lane) {
+    const float x = warp_sum_split<P>(v, lane);
+    return __shfl_sync(0xffffffffu, x, token_lane<P>(lane & (P - 1)));
+}
+
+__device__ __forceinline__ float dot8h(const uint4 w, const float4 a, const float4 b) {
+    float acc = 0.0f;
+    acc = fmaf(__uint_as_float(w.x << 16), a.x, acc);
+    acc = fmaf(__uint_as_float(w.x & 0xffff0000u), a.y, acc);
+    acc = fmaf(__uint_as_float(w.y << 16), a.z, acc);
+    acc = fmaf(__uint_as_float(w.y & 0xffff0000u), a.w, acc);
+    acc = fmaf(__uint_as_float(w.z << 16), b.x, acc);
+    acc = fmaf(__uint_as_float(w.z & 0xffff0000u), b.y, acc);
+    acc = fmaf(__uint_as_float(w.w << 16), b.z, acc);
+    acc = fmaf(__uint_as_float(w.w & 0xffff0000u), b.w, acc);
+    return acc;
+}
+
+// Step 1 of `gr_down_kernel`: rs and xn to global.  Block (token k, stream c): the stream's squares with the thread-to-element mapping of a whole-token block (thread t
+// takes elements 4t + 4 * THREADS * j, those of stream c), so each partial sum, the warp sums and the sum over warps
+// are the ones that block computes, bit for bit - but the token's four streams now run in four blocks.
+__global__ void __launch_bounds__(THREADS) gr_norm_multi_kernel(GrMulti m) {
+    __shared__ float part[WARPS];
+    __shared__ float s_rs;
+    const int k = blockIdx.x, c = blockIdx.y;
+    const FusedGrArgs& a = m.a[k];
+    float* xn = m.xn + (size_t) k * D;
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const float gw = a.apply ? 2.0f * sigmoidf_(a.inj_prev[c] / (float) HC) : 0.0f;
+    float ss = 0.0f;
+    const int j0 = (c * N) / (THREADS * 4), j1 = ((c + 1) * N + THREADS * 4 - 1) / (THREADS * 4);
+    for (int j = j0; j < j1; ++j) {
+        const int i = t * 4 + j * THREADS * 4;
+        if (i < c * N || i >= (c + 1) * N) continue;
+        const int d = i - c * N;
         float4 r = *reinterpret_cast<const float4*>(a.R + i);
         if (a.apply) {
             const float4 b = *reinterpret_cast<const float4*>(a.bo_prev + d);
-            r.x = fmaf(b.x, gw[c], r.x); r.y = fmaf(b.y, gw[c], r.y);
-            r.z = fmaf(b.z, gw[c], r.z); r.w = fmaf(b.w, gw[c], r.w);
+            r.x = fmaf(b.x, gw, r.x); r.y = fmaf(b.y, gw, r.y);
+            r.z = fmaf(b.z, gw, r.z); r.w = fmaf(b.w, gw, r.w);
         }
         const float4 g = *reinterpret_cast<const float4*>(a.w_norm + i);
-        float sq = r.x * r.x + r.y * r.y + r.z * r.z + r.w * r.w;
-#pragma unroll
-        for (int cc = 0; cc < HC; ++cc) if (cc == c) ss[cc] += sq;
+        ss += r.x * r.x + r.y * r.y + r.z * r.z + r.w * r.w;
         *reinterpret_cast<float4*>(xn + i) = make_float4(r.x * g.x, r.y * g.y, r.z * g.z, r.w * g.w);
     }
-#pragma unroll
-    for (int c = 0; c < HC; ++c) {
-        const float v = warp_sum(ss[c]);
-        if (lane == 0) part[warp][c] = v;
-    }
+    const float v = warp_sum(ss);
+    if (lane == 0) part[warp] = v;
     __syncthreads();
-    if (t < HC) {
+    if (t == 0) {
         float s = 0.0f;
-        for (int w = 0; w < WARPS; ++w) s += part[w][t];
-        s_rs[t] = rsqrtf(s / (float) N + a.eps);
-        a.rs[t] = s_rs[t];
+        for (int w = 0; w < WARPS; ++w) s += part[w];
+        s_rs = rsqrtf(s / (float) N + a.eps);
+        a.rs[c] = s_rs;
     }
     __syncthreads();
-    for (int i = t; i < D; i += THREADS) xn[i] *= s_rs[i / N];
+    for (int i = c * N + t; i < (c + 1) * N; i += THREADS) xn[i] *= s_rs;
 }
 
 constexpr int TILE = 2560;             // xn floats per token staged at a time: 320 chunks of 8, 10 per lane
 constexpr int TQ = TILE / 8 / 32;      // uint4 weight chunks per lane per tile
 
 // Step 2 of `gr_down_kernel` for T tokens.  One warp per row (so each lane accumulates the same chunks in the
-// same order as the single-token kernel); per tile the lane's 10 weight chunks are loaded BEFORE the activation
-// tile is staged, so the DRAM and L2 traffic are in flight together.
+// same order as the single-token kernel).  The staged tile keeps each 8-float chunk as two float4 halves in two
+// arrays ([T][2][TILE / 8] float4), so a lane's reads are 16 bytes apart (no bank conflicts), and the next tile's
+// weights are loaded before this tile's dots run.
 __global__ void __launch_bounds__(THREADS) gr_down_multi_kernel(GrMulti m) {
-    extern __shared__ __align__(16) float tile[];   // [T][TILE]
+    extern __shared__ __align__(16) float4 tileh[];   // [T][2][TILE / 8]
+    constexpr int C = TILE / 8;                          // chunks per tile
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
     const int T = m.T;
     const bool inject_block = blockIdx.x == DOWN_BLOCKS;
@@ -196,42 +253,61 @@ __global__ void __launch_bounds__(THREADS) gr_down_multi_kernel(GrMulti m) {
     float acc[kFusedGrMaxT];
 #pragma unroll
     for (int k = 0; k < kFusedGrMaxT; ++k) acc[k] = 0.0f;
-    for (int base = 0; base < D; base += TILE) {
-        uint4 wv[TQ];
-        if (active) {
+    uint4 wv[TQ];
+    if (active) {
 #pragma unroll
-            for (int q = 0; q < TQ; ++q) wv[q] = __ldg(w4 + base / 8 + lane + 32 * q);
-        }
+        for (int q = 0; q < TQ; ++q) wv[q] = __ldg(w4 + lane + 32 * q);
+    }
+    for (int base = 0; base < D; base += TILE) {
         __syncthreads();                                   // the previous tile is consumed
         const float4* src4 = reinterpret_cast<const float4*>(m.xn);
-        float4* tile4 = reinterpret_cast<float4*>(tile);
         for (int i = t; i < T * (TILE / 4); i += THREADS) {
-            const int k = i / (TILE / 4), off = i - k * (TILE / 4);
-            tile4[i] = src4[((size_t) k * D + base) / 4 + off];
+            const int k = i / (TILE / 4), off = i - k * (TILE / 4);   // float4 `off` of token k's tile
+            tileh[(k * 2 + (off & 1)) * C + (off >> 1)] = src4[((size_t) k * D + base) / 4 + off];
         }
         __syncthreads();
         if (!active) continue;
+        uint4 wn[TQ];
+        if (base + TILE < D) {
+#pragma unroll
+            for (int q = 0; q < TQ; ++q) wn[q] = __ldg(w4 + (base + TILE) / 8 + lane + 32 * q);
+        }
 #pragma unroll
         for (int q = 0; q < TQ; ++q) {
             const int j = lane + 32 * q;
 #pragma unroll
             for (int k = 0; k < kFusedGrMaxT; ++k)
-                if (k < T) acc[k] += dot8(wv[q], tile + k * TILE + j * 8);
+                if (k < T) acc[k] += dot8h(wv[q], tileh[(k * 2) * C + j], tileh[(k * 2 + 1) * C + j]);
+        }
+        if (base + TILE < D) {
+#pragma unroll
+            for (int q = 0; q < TQ; ++q) wv[q] = wn[q];
         }
     }
     if (!active) return;
-    float s[kFusedGrMaxT];
+    // lane k gets token k's sum and writes it
+    float mine;
+    if (T == 1) {
+        float v1[1] = {acc[0]};
+        mine = warp_sums_to_lanes<1>(v1, lane);
+    } else if (T == 2) {
+        float v2[2] = {acc[0], acc[1]};
+        mine = warp_sums_to_lanes<2>(v2, lane);
+    } else if (T <= 4) {
+        float v4[4] = {acc[0], acc[1], acc[2], T > 3 ? acc[3] : 0.0f};
+        mine = warp_sums_to_lanes<4>(v4, lane);
+    } else {
+        float v8[8];
 #pragma unroll
-    for (int k = 0; k < kFusedGrMaxT; ++k) s[k] = k < T ? warp_sum(acc[k]) : 0.0f;
-    // lane k writes token k (every lane holds every sum after the xor reduction)
-#pragma unroll
-    for (int k = 0; k < kFusedGrMaxT; ++k) {
-        if (k >= T || lane != k) continue;
+        for (int k = 0; k < 8; ++k) v8[k] = k < T ? acc[k] : 0.0f;
+        mine = warp_sums_to_lanes<8>(v8, lane);
+    }
+    if (lane < T) {
         if (inject_block) {
-            m.a[k].inject_out[row] = s[k];
+            m.a[lane].inject_out[row] = mine;
         } else {
-            const float x = s[k] / (float) HC;
-            m.a[k].lo[row] = x / (1.0f + __expf(-x));
+            const float x = mine / (float) HC;
+            m.a[lane].lo[row] = x / (1.0f + __expf(-x));
         }
     }
 }
@@ -242,46 +318,84 @@ constexpr int UPM_BLOCKS = N / UPM_COLS;          // 160
 // `gr_up_kernel` for T tokens: each row of w_up read once; the T dots reduced by xor so every lane holds every
 // sum, and lane k runs token k's epilogue - the T epilogues in parallel instead of one after another.
 __global__ void __launch_bounds__(THREADS) gr_up_multi_kernel(GrMulti m) {
-    __shared__ __align__(16) float lo[kFusedGrMaxT][LR];
+    // lo as two float4-half arrays per token: chunk c (8 floats) at loh[k][0][c] and loh[k][1][c], so a lane's reads
+    // are 16 bytes apart (no bank conflicts); the dots read the same 8 values in the same order.  The epilogue's inputs
+    // for the block's 64 rows are staged once, coalesced, and each warp loads its next row's weights before the dots.
+    __shared__ __align__(16) float4 loh[kFusedGrMaxT][2][LR / 8];
     __shared__ float g[kFusedGrMaxT][HC][UPM_COLS];
+    __shared__ float rv_s[kFusedGrMaxT][HC][UPM_COLS], wn_s[HC][UPM_COLS], bo_s[kFusedGrMaxT][UPM_COLS];
+    __shared__ float rs_s[kFusedGrMaxT][HC], ip_s[kFusedGrMaxT][HC];
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
     const int T = m.T;
     const int d0 = blockIdx.x * UPM_COLS;
-    for (int i = t; i < T * LR; i += THREADS) lo[i / LR][i % LR] = m.a[i / LR].lo[i % LR];
+    for (int i = t; i < T * (LR / 4); i += THREADS) {
+        const int k = i / (LR / 4), off = i - k * (LR / 4);
+        loh[k][off & 1][off >> 1] = reinterpret_cast<const float4*>(m.a[k].lo)[off];
+    }
+    for (int i = t; i < T * HC * UPM_COLS; i += THREADS) {
+        const int k = i / (HC * UPM_COLS), r = i - k * (HC * UPM_COLS), c = r / UPM_COLS, dd = r - c * UPM_COLS;
+        rv_s[k][c][dd] = m.a[k].R[c * N + d0 + dd];
+    }
+    for (int i = t; i < HC * UPM_COLS; i += THREADS) wn_s[i / UPM_COLS][i % UPM_COLS] = m.a[0].w_norm[(i / UPM_COLS) * N + d0 + i % UPM_COLS];
+    for (int i = t; i < T * UPM_COLS; i += THREADS) {
+        const int k = i / UPM_COLS;
+        if (m.a[k].apply) bo_s[k][i % UPM_COLS] = m.a[k].bo_prev[d0 + i % UPM_COLS];
+    }
+    for (int i = t; i < T * HC; i += THREADS) {
+        const int k = i / HC;
+        rs_s[k][i % HC] = m.a[k].rs[i % HC];
+        if (m.a[k].apply) ip_s[k][i % HC] = m.a[k].inj_prev[i % HC];
+    }
     __syncthreads();
+    auto wrow = [&](int r) {
+        const int c = r / UPM_COLS, dd = r - c * UPM_COLS;
+        return reinterpret_cast<const uint4*>(m.a[0].w_up + (size_t) (c * N + d0 + dd) * LR);
+    };
+    uint4 wa = __ldg(wrow(warp) + lane);
+    uint4 wb = lane < LR / 8 - 32 ? __ldg(wrow(warp) + 32 + lane) : make_uint4(0, 0, 0, 0);
     for (int r = warp; r < HC * UPM_COLS; r += WARPS) {
         const int c = r / UPM_COLS, dd = r - c * UPM_COLS, i = c * N + d0 + dd;
-        const uint4* w4 = reinterpret_cast<const uint4*>(m.a[0].w_up + (size_t) i * LR);
-        const uint4 wa = __ldg(w4 + lane);
-        const uint4 wb = lane < LR / 8 - 32 ? __ldg(w4 + 32 + lane) : make_uint4(0, 0, 0, 0);
-        // the epilogue inputs of this lane's token, fetched while the dots run
-        float rv = 0.0f, wn = 0.0f, rsc = 0.0f, bo = 0.0f, ip = 0.0f;
-        bool apply = false;
-        if (lane < T) {
-            const FusedGrArgs& a = m.a[lane];
-            rv = a.R[i];
-            wn = a.w_norm[i];
-            rsc = a.rs[c];
-            apply = a.apply;
-            if (apply) { bo = a.bo_prev[d0 + dd]; ip = a.inj_prev[c]; }
+        uint4 wan = make_uint4(0, 0, 0, 0), wbn = make_uint4(0, 0, 0, 0);
+        if (r + WARPS < HC * UPM_COLS) {
+            wan = __ldg(wrow(r + WARPS) + lane);
+            if (lane < LR / 8 - 32) wbn = __ldg(wrow(r + WARPS) + 32 + lane);
         }
-        float mine = 0.0f;
+        float acc[kFusedGrMaxT];
 #pragma unroll
         for (int k = 0; k < kFusedGrMaxT; ++k) {
-            if (k >= T) break;
-            float acc = dot8(wa, lo[k] + lane * 8);
-            if (lane < LR / 8 - 32) acc += dot8(wb, lo[k] + (32 + lane) * 8);
-            acc = warp_sum(acc);
-            if (lane == k) mine = acc;
+            acc[k] = 0.0f;
+            if (k < T) {
+                acc[k] = dot8h(wa, loh[k][0][lane], loh[k][1][lane]);
+                if (lane < LR / 8 - 32) acc[k] += dot8h(wb, loh[k][0][32 + lane], loh[k][1][32 + lane]);
+            }
+        }
+        float mine;
+        if (T == 1) {
+            float v1[1] = {acc[0]};
+            mine = warp_sums_to_lanes<1>(v1, lane);
+        } else if (T == 2) {
+            float v2[2] = {acc[0], acc[1]};
+            mine = warp_sums_to_lanes<2>(v2, lane);
+        } else if (T <= 4) {
+            float v4[4] = {acc[0], acc[1], acc[2], acc[3]};
+            mine = warp_sums_to_lanes<4>(v4, lane);
+        } else {
+            float v8[8];
+#pragma unroll
+            for (int k = 0; k < 8; ++k) v8[k] = acc[k];
+            mine = warp_sums_to_lanes<8>(v8, lane);
         }
         if (lane < T) {
-            if (apply) {
-                rv = fmaf(bo, 2.0f * sigmoidf_(ip / (float) HC), rv);
+            float rv = rv_s[lane][c][dd];
+            if (m.a[lane].apply) {
+                rv = fmaf(bo_s[lane][dd], 2.0f * sigmoidf_(ip_s[lane][c] / (float) HC), rv);
                 m.a[lane].R_out[i] = rv;
             }
-            const float x = rv * wn * rsc;
+            const float x = rv * wn_s[c][dd] * rs_s[lane][c];
             g[lane][c][dd] = x * sigmoidf_(mine);
         }
+        wa = wan;
+        wb = wbn;
     }
     __syncthreads();
     for (int i = t; i < T * UPM_COLS; i += THREADS) {
@@ -323,7 +437,7 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
     m.xn = xn_scratch;
     m.T = n_tok;
     cudaStream_t st = (cudaStream_t) stream;
-    gr_norm_multi_kernel<<<n_tok, THREADS, 0, st>>>(m);
+    gr_norm_multi_kernel<<<dim3(n_tok, HC), THREADS, 0, st>>>(m);
     static uint64_t attr_devices = 0;   // a function attribute is per device
     int dev = 0;
     cudaGetDevice(&dev);
