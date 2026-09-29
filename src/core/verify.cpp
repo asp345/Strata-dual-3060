@@ -611,7 +611,8 @@ bool Verifier::record_window(int T, Part& P, std::string& err) {
             nsw.up_type = wsu->native_type; nsw.up_data = wsu->native_data;
             nsw.down_type = wsd->native_type; nsw.down_data = wsd->native_data;
             nsw.q8_1 = P.xq_;
-            f32_to_bf16_bulk(P.mixed_ + tb * N, P.sh_bf16_ + tb * N, (int64_t) n * N, cs);
+            if (!shared_expert_native_bf16())   // the scalar gate's BF16 input (the native gate reads the floats)
+                f32_to_bf16_bulk(P.mixed_ + tb * N, P.sh_bf16_ + tb * N, (int64_t) n * N, cs);
             try {
                 shared_expert_multi(n, xm, P.sh_bf16_ + tb * N, nsw, (const uint16_t*) wgi->data, P.sh_gate_ + (size_t) tb * g.n_ff,
                                     P.sh_up_ + (size_t) tb * g.n_ff, P.sh_g_ + tb, P.shared_ + tb * N, N, g.n_ff, cs);

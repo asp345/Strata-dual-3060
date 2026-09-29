@@ -37,6 +37,8 @@ bool native_mmvq_multi_exact();
 // not reconstruct that sum from the quantized integers.
 void native_quantize_q8_1(const float* x, void* x_q8_1, int n_in, int ncols,
                           void* stream);
+/// The same of silu(gate) * up (the shared expert's SwiGLU, its fast-math operations), without storing it.
+void native_quantize_q8_1_swiglu(const float* gate, const float* up, void* x_q8_1, int n_in, int ncols, void* stream);
 
 void native_q5_k_mmvq(const void* weights, const void* x_q8_1, float* y,
                       int n_in, int n_out, int ncols, void* stream);

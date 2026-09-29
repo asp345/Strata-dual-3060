@@ -155,12 +155,16 @@ __global__ void moe_combine_kernel(const float* __restrict__ parts, const float*
 }  // namespace
 
 void shared_expert_set_native_bf16(bool enabled) { native_bf16 = enabled; }
+bool shared_expert_native_bf16() { return native_bf16; }
 
 namespace {
+// SIGMOID: g holds the gate's logits and each thread takes native_scalar_sigmoid_kernel's value of its token's
+template <bool SIGMOID>
 __global__ void scale_rows_kernel(float* __restrict__ out, const float* __restrict__ g, int n) {
     const int t = blockIdx.y;
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) out[(size_t) t * n + i] *= g[t];
+    const float s = SIGMOID ? __fdividef(1.0f, 1.0f + __expf(-g[t])) : g[t];
+    if (i < n) out[(size_t) t * n + i] *= s;
 }
 }  // namespace
 
@@ -173,19 +177,17 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
     native_quantize_q8_1(x, nw.q8_1, (int) n_embd, n_tok, stream);
     native_mmvq(nw.gate_type, nw.gate_data, nw.q8_1, gate, (int) n_embd, (int) n_ff, n_tok, stream);
     native_mmvq(nw.up_type, nw.up_data, nw.q8_1, up, (int) n_embd, (int) n_ff, n_tok, stream);
-    const int n = (int) (n_ff * n_tok);
-    native_swiglu_kernel<<<(unsigned) ((n + THREADS - 1) / THREADS), THREADS, 0, cs>>>(gate, up, gate, n);
-    native_quantize_q8_1(gate, nw.q8_1, (int) n_ff, n_tok, stream);
+    native_quantize_q8_1_swiglu(gate, up, nw.q8_1, (int) n_ff, n_tok, stream);
     native_mmvq(nw.down_type, nw.down_data, nw.q8_1, out, (int) n_ff, (int) n_embd, n_tok, stream);
+    const dim3 grid((unsigned) ((n_embd + THREADS - 1) / THREADS), (unsigned) n_tok);
     if (native_bf16) {
         bf16_gemv_fp32_mmvf_rows(x, n_embd, gate_inp_bf16, g, 1, n_embd, 1, (int) n_tok, stream);
-        native_scalar_sigmoid_kernel<<<1, 32, 0, cs>>>(g, (int) n_tok);
+        scale_rows_kernel<true><<<grid, THREADS, 0, cs>>>(out, g, (int) n_embd);
     } else {
         for (int t = 0; t < n_tok; ++t)
             scalar_gate_kernel<<<1, 256, 0, cs>>>(x_bf16 + (size_t) t * n_embd, gate_inp_bf16, g + t, (int) n_embd);
+        scale_rows_kernel<false><<<grid, THREADS, 0, cs>>>(out, g, (int) n_embd);
     }
-    scale_rows_kernel<<<dim3((unsigned) ((n_embd + THREADS - 1) / THREADS), (unsigned) n_tok), THREADS, 0, cs>>>(
-        out, g, (int) n_embd);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) throw std::runtime_error(std::string("shared_expert_multi: ") + cudaGetErrorString(e));
 }

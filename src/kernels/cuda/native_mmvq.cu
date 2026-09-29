@@ -137,12 +137,13 @@ __device__ __forceinline__ float warp_max(float x) {
     return x;
 }
 
-__launch_bounds__(QUANT_THREADS, 1)
-__global__ void native_quantize_q8_1_kernel(const float* __restrict__ x,
+template <bool SWIGLU>
+__global__ void __launch_bounds__(QUANT_THREADS, 1) native_quantize_q8_1_kernel(const float* __restrict__ x, const float* __restrict__ up,
                                            Q81Block* __restrict__ y, int n_in) {
     const int i = int(blockIdx.x) * QUANT_THREADS + int(threadIdx.x);
     if (i >= n_in) return; // n_in is a multiple of 32: only whole warps return.
-    const float xi = x[i];
+    // SWIGLU: x is the gate; the value is shared_expert.cu native_swiglu_kernel's expression
+    const float xi = SWIGLU ? __fdividef(x[i], 1.0f + __expf(-x[i])) * up[i] : x[i];
     const float amax = warp_max(fabsf(xi));
     const float sum = warp_sum(xi);
     const float d = amax / 127.0f;
@@ -1158,8 +1159,21 @@ void native_quantize_q8_1(const float* x, void* x_q8_1, int n_in, int ncols, voi
     // ncols * n_in elements: every 32-element block stays inside one column.
     const int n_total = n_in * ncols;
     const unsigned blocks = unsigned((std::size_t(n_total) + QUANT_THREADS - 1) / QUANT_THREADS);
-    native_quantize_q8_1_kernel<<<blocks, QUANT_THREADS, 0,
-                                 static_cast<cudaStream_t>(stream)>>>(x, static_cast<Q81Block*>(x_q8_1), n_total);
+    native_quantize_q8_1_kernel<false><<<blocks, QUANT_THREADS, 0,
+                                        static_cast<cudaStream_t>(stream)>>>(x, nullptr, static_cast<Q81Block*>(x_q8_1), n_total);
+    launch_check();
+}
+
+void native_quantize_q8_1_swiglu(const float* gate, const float* up, void* x_q8_1, int n_in, int ncols, void* stream) {
+    validate_shape(n_in, ncols);
+    validate_pointer(gate);
+    validate_pointer(up);
+    validate_pointer(x_q8_1);
+    validate_stream(stream);
+    const int n_total = n_in * ncols;
+    const unsigned blocks = unsigned((std::size_t(n_total) + QUANT_THREADS - 1) / QUANT_THREADS);
+    native_quantize_q8_1_kernel<true><<<blocks, QUANT_THREADS, 0,
+                                       static_cast<cudaStream_t>(stream)>>>(gate, up, static_cast<Q81Block*>(x_q8_1), n_total);
     launch_check();
 }
 
