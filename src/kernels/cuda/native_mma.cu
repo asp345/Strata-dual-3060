@@ -44,6 +44,14 @@ __device__ __forceinline__ int ld32u(const uint8_t* p) {
 }
 __device__ __forceinline__ int ld32(const uint8_t* p, bool al) { return al ? ld32a(p) : ld32u(p); }
 __device__ __forceinline__ int sub32(int v) { return int(((uint32_t(v) | 0x80808080u) - 0x20202020u) ^ 0x80808080u); }
+// Word t of the 16 bytes at p (2-byte aligned), for lane t of a quad: the quad reads a row's bytes once, contiguously,
+// and shares them by shuffles (the fragment layout otherwise reads 8 rows per load, a few bytes each).
+__device__ __forceinline__ uint32_t word_at(const uint8_t* p) {   // 4 bytes at a 2-byte aligned address
+    const uint16_t* q = reinterpret_cast<const uint16_t*>(p);
+    return (reinterpret_cast<uintptr_t>(p) & 3) == 0 ? *reinterpret_cast<const uint32_t*>(q)
+                                                     : uint32_t(q[0]) | (uint32_t(q[1]) << 16);
+}
+__device__ __forceinline__ uint32_t quad_word(const uint8_t* p, int t) { return word_at(p + 4 * t); }
 __device__ __forceinline__ float h2f(const uint8_t* p) { return __half2float(*reinterpret_cast<const half*>(p)); }
 
 // The lane's activation views: B column g; C columns 2t and 2t + 1.  A column past ncols reads as zero.
@@ -55,11 +63,13 @@ struct Cols {
     __device__ float d1(int kb) const { return ok1 ? __low2float(x1[kb].ds) : 0.f; }
 };
 
-// A format F decodes 64-value units of a row pair (unit): its codebook, TBL words (tword), is in shared memory.
+// A format F decodes 64-value units of a row pair (unit), reading its codebook (TBL words; tword, gtable) from
+// shared memory or through L1 (SMEM).
 // C fragment: c[0] (row g, col 2t), c[1] (row g, col 2t + 1), c[2] (row g + 8, col 2t), c[3] (row g + 8, col 2t + 1).
 
 struct Q6K {   // 210-byte blocks: ql[128] qh[64] scales[16] d; a unit is chunks j and j + 2 of half h
     static constexpr int QK = 256, BYTES = 210, TBL = 0;
+    static constexpr bool SMEM = false;
     __device__ static uint32_t tword(int) { return 0; }
     __device__ static void unit(const uint8_t* w0, const uint8_t* w1, int u, int t, const Cols& c, float (&acc)[4],
                                 const uint32_t*) {
@@ -113,6 +123,7 @@ __device__ __forceinline__ void scale_min_k4(int j, const uint8_t* q, int& sc, i
 template<bool Q5>
 struct QK45 {
     static constexpr int QK = 256, BYTES = Q5 ? 176 : 144, QS = Q5 ? 48 : 16, TBL = 0;
+    static constexpr bool SMEM = false;
     __device__ static uint32_t tword(int) { return 0; }
     __device__ static void unit(const uint8_t* w0, const uint8_t* w1, int u, int t, const Cols& c, float (&acc)[4],
                                 const uint32_t*) {
@@ -173,6 +184,7 @@ __device__ __forceinline__ int2 iq4_lookup(int q4) {
 
 struct IQ4XS {   // 136 bytes: d scales_h scales_l[4] qs[128]; sub-block j: qs[16j..16j+16), low nibble -> values 0..15
     static constexpr int QK = 256, BYTES = 136, TBL = 0;
+    static constexpr bool SMEM = false;
     __device__ static uint32_t tword(int) { return 0; }
     __device__ static void unit(const uint8_t* w0, const uint8_t* w1, int u, int t, const Cols& c, float (&acc)[4],
                                 const uint32_t*) {
@@ -215,40 +227,51 @@ __device__ __forceinline__ uint32_t ksign8(uint32_t v7) {   // 7 sign bits and t
 // index qs[8j + e] | qh[j] bit e << 8, signs byte 4j + e / 2, nibble e & 1.  Lane t takes entries t and 4 + t.
 struct IQ3S {
     static constexpr int QK = 256, BYTES = 110, TBL = 512;
+    static constexpr bool SMEM = true;
     __device__ static uint32_t tword(int i) { return iq3s_grid[i]; }
-    __device__ static int entry(const uint8_t* b, int sub, int e, int qh, const uint32_t* tbl) {
-        const int idx = b[2 + 8 * sub + e] | (((qh >> e) & 1) << 8);
-        const int sg = (b[74 + 4 * sub + (e >> 1)] >> (4 * (e & 1))) & 0xF;
-        return neg4(tbl[idx], uint32_t(sg));
-    }
+    __device__ static const uint32_t* gtable() { return iq3s_grid; }
     __device__ static void unit(const uint8_t* w0, const uint8_t* w1, int u, int t, const Cols& c, float (&acc)[4],
                                 const uint32_t* grid) {
-        const int sb = u >> 2, i = u & 3;
-        const uint8_t* b0 = w0 + size_t(sb) * BYTES;
-        const uint8_t* b1 = w1 + size_t(sb) * BYTES;
-        const int qh0 = *reinterpret_cast<const uint16_t*>(b0 + 66 + 2 * i);
-        const int qh1 = *reinterpret_cast<const uint16_t*>(b1 + 66 + 2 * i);
-        const int sc0 = b0[106 + i], sc1 = b1[106 + i];
+        const int sb = u >> 2, i = u & 3, base = (threadIdx.x & 31) & ~3;
+        const uint8_t* b[2] = {w0 + size_t(sb) * BYTES, w1 + size_t(sb) * BYTES};
+        uint32_t q[2], g[2];
+        int qh[2], sc[2];
+#pragma unroll
+        for (int r = 0; r < 2; ++r) {
+            q[r] = quad_word(b[r] + 2 + 16 * i, t);                          // indices of sub-blocks 2i, 2i + 1
+            g[r] = t < 2 ? word_at(b[r] + 74 + 8 * i + 4 * t) : 0u;         // their sign nibbles
+            qh[r] = *reinterpret_cast<const uint16_t*>(b[r] + 66 + 2 * i);
+            sc[r] = b[r][106 + i];
+        }
         float s[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
         for (int k = 0; k < 2; ++k) {
-            const int sub = 2 * i + k, kb = sb * 8 + sub;
-            const int q0 = qh0 >> (8 * k), q1 = qh1 >> (8 * k);
+            const int kb = sb * 8 + 2 * i + k;
+            int a[4], l[2];
+#pragma unroll
+            for (int r = 0; r < 2; ++r) {
+                const uint32_t ia = __shfl_sync(0xffffffffu, q[r], base | (2 * k));       // entries 0..3
+                const uint32_t ib = __shfl_sync(0xffffffffu, q[r], base | (2 * k + 1));   // entries 4..7
+                const uint32_t sw = __shfl_sync(0xffffffffu, g[r], base | k);
+                const int h = qh[r] >> (8 * k);
+                a[r] = neg4(grid[((ia >> (8 * t)) & 0xFF) | (((h >> t) & 1) << 8)], (sw >> (4 * t)) & 0xF);
+                a[2 + r] = neg4(grid[((ib >> (8 * t)) & 0xFF) | (((h >> (4 + t)) & 1) << 8)], (sw >> (16 + 4 * t)) & 0xF);
+                l[r] = 1 + 2 * ((sc[r] >> (4 * k)) & 0xF);
+            }
             int C[4] = {0, 0, 0, 0};
-            mma32(C, entry(b0, sub, t, q0, grid), entry(b1, sub, t, q1, grid), entry(b0, sub, 4 + t, q0, grid),
-                  entry(b1, sub, 4 + t, q1, grid), c.b(kb, t), c.b(kb, 4 + t));
-            const int l0 = 1 + 2 * ((sc0 >> (4 * k)) & 0xF), l1 = 1 + 2 * ((sc1 >> (4 * k)) & 0xF);
+            mma32(C, a[0], a[1], a[2], a[3], c.b(kb, t), c.b(kb, 4 + t));
             const float x0 = c.d0(kb), x1 = c.d1(kb);
-            s[0] += x0 * float(l0 * C[0]); s[1] += x1 * float(l0 * C[1]);
-            s[2] += x0 * float(l1 * C[2]); s[3] += x1 * float(l1 * C[3]);
+            s[0] += x0 * float(l[0] * C[0]); s[1] += x1 * float(l[0] * C[1]);
+            s[2] += x0 * float(l[1] * C[2]); s[3] += x1 * float(l[1] * C[3]);
         }
-        const float d0 = h2f(b0), d1 = h2f(b1);
+        const float d0 = h2f(b[0]), d1 = h2f(b[1]);
         acc[0] += d0 * s[0]; acc[1] += d0 * s[1]; acc[2] += d1 * s[2]; acc[3] += d1 * s[3];
     }
 };
 
 struct IQ4NL {   // 18 bytes: d qs[16], 32 values; a unit is two blocks
     static constexpr int QK = 32, BYTES = 18, TBL = 0;
+    static constexpr bool SMEM = false;
     __device__ static uint32_t tword(int) { return 0; }
     __device__ static void unit(const uint8_t* w0, const uint8_t* w1, int u, int t, const Cols& c, float (&acc)[4],
                                 const uint32_t*) {
@@ -269,6 +292,7 @@ struct IQ4NL {   // 18 bytes: d qs[16], 32 values; a unit is two blocks
 
 struct Q20 {   // 18 bytes: d qs[16], 64 values of 2 bits; lane t takes values 8t..8t+7 of each 32
     static constexpr int QK = 64, BYTES = 18, TBL = 0;
+    static constexpr bool SMEM = false;
     __device__ static uint32_t tword(int) { return 0; }
     __device__ static void unit(const uint8_t* w0, const uint8_t* w1, int u, int t, const Cols& c, float (&acc)[4],
                                 const uint32_t*) {
@@ -300,13 +324,17 @@ struct Q20 {   // 18 bytes: d qs[16], 64 values of 2 bits; lane t takes values 8
 // and a 4-bit scale.  Lane t takes grid entry t: values 8t..8t+7.
 struct IQ2XXS {
     static constexpr int QK = 256, BYTES = 66, TBL = 512;
+    static constexpr bool SMEM = false;
     __device__ static uint32_t tword(int i) { return reinterpret_cast<const uint32_t*>(iq2xxs_grid)[i]; }
+    __device__ static const uint32_t* gtable() { return reinterpret_cast<const uint32_t*>(iq2xxs_grid); }
     __device__ static void unit(const uint8_t* w0, const uint8_t* w1, int u, int t, const Cols& c, float (&acc)[4],
                                 const uint32_t* tbl) {
-        const int sb = u >> 2, i = u & 3;
+        const int sb = u >> 2, i = u & 3, base = (threadIdx.x & 31) & ~3;
         const uint8_t* b0 = w0 + size_t(sb) * BYTES;
         const uint8_t* b1 = w1 + size_t(sb) * BYTES;
         const uint2* grid = reinterpret_cast<const uint2*>(tbl);
+        // the unit's 16 bytes of a row (sub-blocks 2i, 2i + 1: indices, then signs and scale), word t in lane t
+        const uint32_t q[2] = {quad_word(b0 + 2 + 16 * i, t), quad_word(b1 + 2 + 16 * i, t)};
         float s[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
         for (int k = 0; k < 2; ++k) {
@@ -314,9 +342,9 @@ struct IQ2XXS {
             int a[4], ls[2];
 #pragma unroll
             for (int r = 0; r < 2; ++r) {
-                const uint8_t* b = r ? b1 : b0;
-                const uint32_t aux = uint32_t(ld32u(b + 6 + 8 * sub));
-                const uint2 gp = grid[b[2 + 8 * sub + t]];
+                const uint32_t idx = __shfl_sync(0xffffffffu, q[r], base | (2 * k));
+                const uint32_t aux = __shfl_sync(0xffffffffu, q[r], base | (2 * k + 1));
+                const uint2 gp = grid[(idx >> (8 * t)) & 0xFF];
                 const uint32_t sg = ksign8(aux >> (7 * t));
                 a[r] = neg4(gp.x, sg);
                 a[2 + r] = neg4(gp.y, sg >> 4);
@@ -337,7 +365,9 @@ struct IQ2XXS {
 // and a 4-bit scale.  Lane t takes entries 2t and 2t + 1: values 8t..8t+7.
 struct IQ3XXS {
     static constexpr int QK = 256, BYTES = 98, TBL = 256;
+    static constexpr bool SMEM = false;
     __device__ static uint32_t tword(int i) { return iq3xxs_grid[i]; }
+    __device__ static const uint32_t* gtable() { return iq3xxs_grid; }
     __device__ static void unit(const uint8_t* w0, const uint8_t* w1, int u, int t, const Cols& c, float (&acc)[4],
                                 const uint32_t* tbl) {
         const int sb = u >> 2, i = u & 3;
@@ -376,8 +406,12 @@ struct IQ3XXS {
 template<bool S>
 struct IQ2XSS {
     static constexpr int QK = 256, BYTES = S ? 82 : 74, TBL = S ? 2048 : 1024, SC = S ? 74 : 66;
+    static constexpr bool SMEM = !S;
     __device__ static uint32_t tword(int i) {
         return S ? reinterpret_cast<const uint32_t*>(iq2s_grid)[i] : reinterpret_cast<const uint32_t*>(iq2xs_grid)[i];
+    }
+    __device__ static const uint32_t* gtable() {
+        return S ? reinterpret_cast<const uint32_t*>(iq2s_grid) : reinterpret_cast<const uint32_t*>(iq2xs_grid);
     }
     __device__ static void unit(const uint8_t* w0, const uint8_t* w1, int u, int t, const Cols& c, float (&acc)[4],
                                 const uint32_t* tbl) {
@@ -423,12 +457,20 @@ struct IQ2XSS {
     }
 };
 
+// The codebook the units read: a block's shared copy (F::SMEM, TBL words) or the global table through L1, whichever
+// measured faster for the format.
 template<typename F>
-__device__ __forceinline__ void load_table(uint32_t* tbl) {
+__device__ __forceinline__ const uint32_t* load_table(uint32_t* tbl) {
     if constexpr (F::TBL > 0) {
-        for (int i = threadIdx.x; i < F::TBL; i += blockDim.x) tbl[i] = F::tword(i);
-        __syncthreads();
+        if constexpr (F::SMEM) {
+            for (int i = threadIdx.x; i < F::TBL; i += blockDim.x) tbl[i] = F::tword(i);
+            __syncthreads();
+            return tbl;
+        } else {
+            return F::gtable();
+        }
     }
+    return tbl;
 }
 
 template<typename F>
@@ -445,10 +487,10 @@ __global__ void __launch_bounds__(NWT * 32) kernel(const uint8_t* __restrict__ w
     c.xg = x + size_t(c.gok ? g : 0) * xs;
     c.x0 = x + size_t(c.ok0 ? 2 * t : 0) * xs;
     c.x1 = x + size_t(c.ok1 ? 2 * t + 1 : 0) * xs;
-    __shared__ uint32_t tbl[F::TBL > 0 ? F::TBL : 1];
-    load_table<F>(tbl);
+    __shared__ uint32_t tbl[F::SMEM ? F::TBL : 1];
+    const uint32_t* cb = load_table<F>(tbl);
     float acc[4] = {0.f, 0.f, 0.f, 0.f};
-    for (int u = warp; u < nu; u += NWT) F::unit(w0, w1, u, t, c, acc, tbl);
+    for (int u = warp; u < nu; u += NWT) F::unit(w0, w1, u, t, c, acc, cb);
     __shared__ float part[NWT - 1][4][32];
     if (warp > 0)
         for (int i = 0; i < 4; ++i) part[warp - 1][i][lane] = acc[i];
@@ -500,8 +542,8 @@ __global__ void __launch_bounds__(GU_NW * 32) expert_gu_kernel(const unsigned lo
                                                                float* __restrict__ h) {
     const int grp = blockIdx.y;
     if (grp >= *n_groups) return;
-    __shared__ uint32_t tbl[F::TBL > 0 ? F::TBL : 1];
-    load_table<F>(tbl);
+    __shared__ uint32_t tbl[F::SMEM ? F::TBL : 1];
+    const uint32_t* cb = load_table<F>(tbl);
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     const int n_ff = int(L.n_ff), nu = int(L.n_embd / 64), r = blockIdx.x * 8 + g;   // rows g: gate r; rows g + 8: up r
     const int e0 = grp_start[grp], n = grp_start[grp + 1] - e0;
@@ -510,7 +552,7 @@ __global__ void __launch_bounds__(GU_NW * 32) expert_gu_kernel(const unsigned lo
     const uint8_t* wg = blob + size_t(r) * L.gu_row;
     const uint8_t* wu = blob + L.up_off + size_t(r) * L.gu_row;
     float acc[4] = {0.f, 0.f, 0.f, 0.f};
-    for (int u = warp; u < nu; u += GU_NW) F::unit(wg, wu, u, t, c, acc, tbl);
+    for (int u = warp; u < nu; u += GU_NW) F::unit(wg, wu, u, t, c, acc, cb);
     if (!reduce_warps<GU_NW>(acc, warp, lane)) return;
     if (c.ok0) h[size_t(e0 + 2 * t) * n_ff + r] = acc[0] / (1.0f + __expf(-acc[0])) * acc[2];
     if (c.ok1) h[size_t(e0 + 2 * t + 1) * n_ff + r] = acc[1] / (1.0f + __expf(-acc[1])) * acc[3];
@@ -525,15 +567,15 @@ __global__ void __launch_bounds__(DN_NW * 32) expert_down_kernel(const unsigned 
                                                                  float* __restrict__ out) {
     const int grp = blockIdx.y;
     if (grp >= *n_groups) return;
-    __shared__ uint32_t tbl[F::TBL > 0 ? F::TBL : 1];
-    load_table<F>(tbl);
+    __shared__ uint32_t tbl[F::SMEM ? F::TBL : 1];
+    const uint32_t* cb = load_table<F>(tbl);
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     const int n_embd = int(L.n_embd), nu = int(L.n_ff / 64), r0 = blockIdx.x * 16 + g, r1 = r0 + 8;
     const int e0 = grp_start[grp], n = grp_start[grp + 1] - e0;
     const Cols c = entry_cols(hq, nullptr, e0, n, int(L.n_ff / 32), g, t);
     const uint8_t* blob = reinterpret_cast<const uint8_t*>(grp_ptr[grp]) + L.down_off;
     float acc[4] = {0.f, 0.f, 0.f, 0.f};
-    for (int u = warp; u < nu; u += DN_NW) F::unit(blob + size_t(r0) * L.d_row, blob + size_t(r1) * L.d_row, u, t, c, acc, tbl);
+    for (int u = warp; u < nu; u += DN_NW) F::unit(blob + size_t(r0) * L.d_row, blob + size_t(r1) * L.d_row, u, t, c, acc, cb);
     if (!reduce_warps<DN_NW>(acc, warp, lane)) return;
     if (c.ok0) {
         float* o = out + size_t(ent_dst[e0 + 2 * t]) * n_embd;
