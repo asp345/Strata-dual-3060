@@ -191,7 +191,10 @@ struct Options {
     /// pool's own drain: 33.7 GB/s against 5/6 x 44.14 = 36.8 for five workers, on a machine whose sixth core
     /// is reserved for a host thread that has nothing to do while the drain runs.
     bool no_host_worker = false;
-    bool mmap_experts = false;    ///< R2.1: opt OUT of the resident arena, back to MapViewOfFile
+    /// The low-RAM mode: the experts come from the pack's mapped experts.bin, with a pinned copy of the ones the pool,
+    /// the PCIe share and the prompt path read (see the pin step after the VRAM tier is filled).
+    bool mmap_experts = false;
+    double pin_experts_gib = -1.0;   ///< caps that pinned copy (< 0: every expert those paths read)
     /// R4: slots of VRAM-resident experts.  **0 = off, and off is the default.**
     /// **THE COMMENT THAT USED TO BE HERE WAS FALSE AND ROUND 328 MEASURED IT.**  It said "the cache has no
     /// consumer yet - `moe_hit_grouped_s2` does not exist - so switching it on costs the fill traffic and
@@ -439,9 +442,11 @@ void usage() {
                  "                       draft layer.  More than one GPU needs a native (IQ) pack\n"
                  "  --gpu-split LIST     the first layer of every GPU after the first (default: from each GPU's free\n"
                  "                       VRAM and host link bandwidth, measured at start)\n"
-                 "  --mmap-experts       R2.1: opt OUT of the resident expert arena, back to MapViewOfFile.\n"
-                 "                       The A/B arm: the mmap's rate depends on the OS page cache holding\n"
-                 "                       34 GB, and measured 71.97 vs 34.78 ms/token cold vs warm.\n");
+                 "  --mmap-experts       Low RAM: map the pack's experts.bin instead of loading every expert into\n"
+                 "                       RAM; the experts no VRAM cache holds and those the prompt path borrows\n"
+                 "                       are pinned in RAM, the other cached ones are read from the file\n"
+                 "  --pin-experts-gib N  with --mmap-experts: at most N GiB pinned (the lowest-priority cached\n"
+                 "                       experts, then the least-routed missing ones, are read from the file)\n");
 }
 
 /// All shards of a split GGUF, from shard 1's path ("...-00001-of-00002.gguf"); just the path when it is not split.
@@ -1283,6 +1288,7 @@ int main(int argc, char** argv) {
         else if (a == "--expert-profile") o.expert_profile = next("--expert-profile");
         else if (a == "--gpu-stages") o.gpu_stages = true;
         else if (a == "--mmap-experts") o.mmap_experts = true;
+        else if (a == "--pin-experts-gib") o.pin_experts_gib = std::atof(next("--pin-experts-gib"));
         else if (a == "--stats") o.stats = true;
         else if (a == "--shared-late") o.shared_late = true;
         else if (a == "--keep-canonical") o.keep_canonical = true;
@@ -1859,7 +1865,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
-        std::fprintf(stderr, "strata generate: experts via mmap (--mmap-experts; the A/B arm of R2.1)\n");
+        std::fprintf(stderr, "strata generate: low-RAM mode: the experts mapped from %s/experts.bin\n", o.pack.c_str());
         srcp = &src;
     } else {
         arena_src.set_gguf(o.native_preset);   // plan v0.3 P6: a native pack may take its experts from shard 1
@@ -2904,6 +2910,66 @@ int main(int argc, char** argv) {
         for (int st = 0; st < n_stages; ++st) n += tier.first[(size_t) st + 1] - first[(size_t) st];
         return n;
     };
+    // The low-RAM mode's pinned copy, in order: the experts no VRAM cache holds (the pool computes them, the PCIe
+    // share and the prompt path stream them), by profile rank; then the cached ones from the last slot of each cache
+    // (the prompt path borrows slots from the end; its largest chunk's are all in the default budget). Every expert
+    // those paths read is then pinned as in the arena, and only cached experts no prompt borrows stay in the file.
+    if (o.mmap_experts) {
+        const auto& lay = strata::kernels::cpu::expert_layout();
+        std::vector<int32_t> first;
+        if (o.prefill_chunk > 0 && !o.no_prefill_borrow && d_res != nullptr) {
+            strata::prefill::Prefill::set_pinned_share(1.0);   // every expert the prompt path streams is pinned below
+            int64_t chunk = o.prefill_chunk;
+            first = plan_lend(chunk);
+        }
+        std::vector<std::pair<int32_t, int32_t>> order;
+        std::vector<char> seen((size_t) (g.n_layers * g.n_expert), 0);
+        uint64_t streamed = 0;   // the bytes the pool, the PCIe share or a prompt may read
+        auto push = [&](int32_t l, int32_t e) {
+            char& c = seen[(size_t) l * (size_t) g.n_expert + (size_t) e];
+            if (c) return;
+            c = 1;
+            order.emplace_back(l, e);
+        };
+        for (const auto& pr : profile)
+            if (tier.slot_of(pr.first, pr.second) == strata::core::kNotResident) push(pr.first, pr.second);
+        for (int32_t l = 0; l < (int32_t) g.n_layers; ++l)
+            for (int32_t e = 0; e < (int32_t) g.n_expert; ++e)
+                if (tier.slot_of(l, e) == strata::core::kNotResident) push(l, e);
+        for (const auto& [l, e] : order) streamed += lay.blob_bytes(l);
+        std::vector<std::tuple<int32_t, int32_t, int32_t>> cached;   // (slots from its cache's end, layer, expert)
+        for (int32_t l = 0; l < (int32_t) g.n_layers; ++l)
+            for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
+                const int32_t slot = tier.slot_of(l, e);
+                if (slot == strata::core::kNotResident) continue;
+                const int st = tier.stage_of_slot(slot);
+                cached.emplace_back(tier.first[(size_t) st + 1] - 1 - slot, l, e);
+                if (!first.empty() && slot >= first[(size_t) st]) streamed += lay.blob_bytes(l);
+            }
+        std::sort(cached.begin(), cached.end());
+        for (const auto& [d, l, e] : cached) push(l, e);
+        const uint64_t budget = o.pin_experts_gib >= 0.0 ? (uint64_t) (o.pin_experts_gib * 1073741824.0) : streamed;
+        const auto t0 = Clock::now();
+        if (!src.pin(order, budget, 8, err)) {
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "strata generate: low-RAM mode: %lld experts (%.2f GiB) pinned in %.1f s, %.2f GiB read from "
+                             "the file; %s\n", (long long) src.pinned_count(), (double) src.pinned_bytes() / 1073741824.0,
+                     std::chrono::duration<double>(Clock::now() - t0).count(),
+                     (double) (lay.total - src.pinned_bytes()) / 1073741824.0, src.pin_note().c_str());
+        mem_mark("the low-RAM mode's pinned copy");
+        // the prompt path's streamed ring and lend cap: the share of what it streams that is pinned
+        uint64_t pinned = 0;
+        for (int32_t l = 0; l < (int32_t) g.n_layers; ++l)
+            for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
+                const int32_t slot = tier.slot_of(l, e);
+                const bool maybe_streamed = slot == strata::core::kNotResident ||
+                                            (!first.empty() && slot >= first[(size_t) tier.stage_of_slot(slot)]);
+                if (maybe_streamed && src.pinned(l, e)) pinned += lay.blob_bytes(l);
+            }
+        strata::prefill::Prefill::set_pinned_share(streamed ? (double) pinned / (double) streamed : 1.0);
+    }
     if (o.serve) {
         if (o.spec < 2 || o.mtp.empty() || o.prefill_chunk <= 0 ||
             (graph_hits && (thits.d_res == nullptr || host_res.empty()))) {
@@ -3095,7 +3161,7 @@ int main(int argc, char** argv) {
                 const int32_t* r = host_res.data() + l * g.n_expert;
                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
                     if (r[e] < 0) { if (u[e] >= 2.0f) cand.emplace_back(u[e], e); }
-                    else vict.emplace_back(u[e], e);
+                    else if (srcp->pinned(l, e)) vict.emplace_back(u[e], e);   // low RAM: without a pinned copy it stays cached
                 }
                 if (cand.empty() || vict.empty()) continue;
                 std::sort(cand.begin(), cand.end(), [](auto& a, auto& b) { return a.first > b.first; });
@@ -4337,7 +4403,7 @@ int main(int argc, char** argv) {
                 const int32_t* r = host_res.data() + l * g.n_expert;
                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
                     if (r[e] < 0) { if (u[e] >= 2.0f) cand.emplace_back(u[e], e); }
-                    else vict.emplace_back(u[e], e);
+                    else if (srcp->pinned(l, e)) vict.emplace_back(u[e], e);   // low RAM: without a pinned copy it stays cached
                 }
                 if (cand.empty() || vict.empty()) continue;
                 std::sort(cand.begin(), cand.end(), [](auto& a, auto& b) { return a.first > b.first; });

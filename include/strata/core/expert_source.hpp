@@ -287,20 +287,40 @@ public:
     bool open(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err);
     void close();
 
+    /// The low-RAM mode: the pairs of `order`, from its start while their bytes fit in `budget`, are copied into a
+    /// pinned, mapped arena that `blob` then serves (a GPU reads them over PCIe); the others stay in the mapped file.
+    /// The file's pages are released from the page cache afterwards.
+    bool pin(const std::vector<std::pair<int32_t, int32_t>>& order, uint64_t budget, int threads, std::string& err);
+    uint64_t pinned_bytes() const { return pinned_bytes_; }
+    int64_t pinned_count() const { return pinned_count_; }
+    const std::string& pin_note() const { return pin_note_; }
+
     bool mapped() const { return base_ != nullptr; }
     int64_t blobs() const { return blobs_; }
 
     const uint8_t* blob(int64_t layer, int64_t expert) override;
+    bool pinned(int64_t layer, int64_t expert) const override;
+    const uint8_t* device_alias(int64_t layer, int64_t expert) const override;
 
     /// Blobs touched, for the driver to report.  With `h = 0` this is `48 * k` per token and the number is only
     /// interesting once Phase 3 makes it not so.
     int64_t reads() const override { return reads_; }
 
 private:
+    static constexpr uint64_t kMapped = ~uint64_t{0};
+    uint64_t pin_offset(int64_t layer, int64_t expert) const;
     const uint8_t* base_ = nullptr;
+    uint64_t mapped_bytes_ = 0;
     int64_t blobs_ = 0;
     int64_t n_expert_ = 0;
     int64_t reads_ = 0;
+    void* arena_ = nullptr;                   ///< PinnedArena of the pinned pairs
+    std::vector<uint64_t> pin_off_;           ///< per (layer, expert): offset in the arena, or kMapped
+    std::vector<uint64_t> slice_start_;       ///< the arena's registered slices (one when it registered whole)
+    std::vector<const uint8_t*> slice_dev_;   ///< their device aliases
+    uint64_t registered_bytes_ = 0, pinned_bytes_ = 0;
+    int64_t pinned_count_ = 0;
+    std::string pin_note_;
 #if defined(_WIN32)
     void* file_ = nullptr;
     void* mapping_ = nullptr;
