@@ -155,8 +155,8 @@ void FileExpertSource::close() {
     pinned_count_ = 0;
 }
 
-bool FileExpertSource::pin(const std::vector<std::pair<int32_t, int32_t>>& order, uint64_t budget, int threads,
-                           std::string& err) {
+bool FileExpertSource::pin(const std::vector<std::pair<int32_t, int32_t>>& order, uint64_t budget, int staging,
+                           int threads, std::string& err) {
     const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
     if (base_ == nullptr) { err = "FileExpertSource: pin before open"; return false; }
     if (arena_ != nullptr) { err = "FileExpertSource: already pinned"; return false; }
@@ -195,15 +195,18 @@ bool FileExpertSource::pin(const std::vector<std::pair<int32_t, int32_t>>& order
         }
         if (at > start) bounds.push_back(start);
     }
-    bounds.push_back(at);
-    if (at == 0) return true;
+    staging_off_ = at;
+    if (staging > 0) bounds.push_back(at);
+    bounds.push_back(at + (uint64_t) staging * lay.max_blob);
+    if (at == 0 && staging == 0) return true;
 #if !defined(_WIN32)
     // the file's pages read so far (the VRAM tier's fill) leave the page cache first: the arena then finds free 2 MB
     // blocks for its transparent huge pages, which the CPU pool reads it through
     madvise((void*) base_, (size_t) mapped_bytes_, MADV_DONTNEED);
     posix_fadvise(fd_, 0, 0, POSIX_FADV_DONTNEED);
 #endif
-    PinnedArena* a = new PinnedArena(at + lay.max_blob, bounds);   // a whole slot's copy may start at any expert
+    // a whole slot's copy may start at any expert
+    PinnedArena* a = new PinnedArena(at + (uint64_t) (staging + 1) * lay.max_blob, bounds);
     if (!a->valid()) {
         delete a;
         err = "FileExpertSource: the pinned arena could not be reserved (" + std::to_string(at) + " B)";
@@ -266,6 +269,16 @@ bool FileExpertSource::pin(const std::vector<std::pair<int32_t, int32_t>>& order
     posix_fadvise(fd_, 0, 0, POSIX_FADV_DONTNEED);
 #endif
     return true;
+}
+
+uint64_t FileExpertSource::staging_offset(int k) const {
+    return staging_off_ + (uint64_t) k * strata::kernels::cpu::expert_layout().max_blob;
+}
+
+uint8_t* FileExpertSource::host(uint64_t off) const { return ((PinnedArena*) arena_)->data() + off; }
+
+void FileExpertSource::place(int64_t layer, int64_t expert, uint64_t off) {
+    pin_off_[(size_t) (layer * n_expert_ + expert)] = off;
 }
 
 uint64_t FileExpertSource::pin_offset(int64_t layer, int64_t expert) const {

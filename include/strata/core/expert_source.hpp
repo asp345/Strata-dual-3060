@@ -290,10 +290,20 @@ public:
     /// The low-RAM mode: the pairs of `order`, from its start while their bytes fit in `budget`, are copied into a
     /// pinned, mapped arena that `blob` then serves (a GPU reads them over PCIe); the others stay in the mapped file.
     /// The file's pages are released from the page cache afterwards.
-    bool pin(const std::vector<std::pair<int32_t, int32_t>>& order, uint64_t budget, int threads, std::string& err);
+    /// `staging` extra blobs at the arena's end hold experts in transit (`stage`, `settle`).
+    bool pin(const std::vector<std::pair<int32_t, int32_t>>& order, uint64_t budget, int staging, int threads,
+             std::string& err);
     uint64_t pinned_bytes() const { return pinned_bytes_; }
     int64_t pinned_count() const { return pinned_count_; }
     const std::string& pin_note() const { return pin_note_; }
+    /// Places in the pinned arena (byte offsets): staging blob k (the largest blob's size), an expert's pinned copy
+    /// (kMapped: none), and its host address.  `place` serves `expert` of `layer` from `off` (kMapped: the file); only
+    /// while no reader holds its pointer.
+    static constexpr uint64_t kMapped = ~uint64_t{0};
+    uint64_t staging_offset(int k) const;
+    uint64_t pinned_offset(int64_t layer, int64_t expert) const { return pin_offset(layer, expert); }
+    uint8_t* host(uint64_t off) const;
+    void place(int64_t layer, int64_t expert, uint64_t off);
 
     bool mapped() const { return base_ != nullptr; }
     int64_t blobs() const { return blobs_; }
@@ -307,7 +317,6 @@ public:
     int64_t reads() const override { return reads_; }
 
 private:
-    static constexpr uint64_t kMapped = ~uint64_t{0};
     uint64_t pin_offset(int64_t layer, int64_t expert) const;
     const uint8_t* base_ = nullptr;
     uint64_t mapped_bytes_ = 0;
@@ -318,7 +327,7 @@ private:
     std::vector<uint64_t> pin_off_;           ///< per (layer, expert): offset in the arena, or kMapped
     std::vector<uint64_t> slice_start_;       ///< the arena's registered slices (one when it registered whole)
     std::vector<const uint8_t*> slice_dev_;   ///< their device aliases
-    uint64_t registered_bytes_ = 0, pinned_bytes_ = 0;
+    uint64_t registered_bytes_ = 0, pinned_bytes_ = 0, staging_off_ = 0;
     int64_t pinned_count_ = 0;
     std::string pin_note_;
 #if defined(_WIN32)

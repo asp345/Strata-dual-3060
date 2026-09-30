@@ -989,6 +989,88 @@ struct LayerCosts {
 /// Host-to-device bandwidth of each pipeline GPU, measured by `setup_placement` (bytes/s; one GPU: {1}).
 std::vector<double> g_link_bw{1.0};
 
+/// The low-RAM mode's side of the adaptive tier.  A cached expert without a pinned copy (FileExpertSource leaves
+/// those in the file) may be evicted too, so the tier adapts as with the arena, without reading the file: on the slot's
+/// refill stream its bytes go from the slot into a free place of the pinned arena, then its replacement comes in from
+/// its pinned copy.  Once the copies have landed the evicted expert is served from that place, and the replacement's
+/// pinned copy, which it no longer needs in VRAM, becomes a free place.  The arena starts with kSlots free places of
+/// the largest blob's size; nothing waits for these copies.  With the arena every expert is pinned and none is
+/// exchanged.
+struct PinExchange {
+    static constexpr int kSlots = 64;      ///< free places at the start: exchanges per round
+    strata::core::FileExpertSource* src = nullptr;
+    struct Place { uint64_t off, bytes; };
+    std::vector<Place> free;               ///< places in the pinned arena nothing is served from
+    struct X { int32_t layer, in, out; Place at; };
+    std::vector<X> inflight;               ///< issued, not landed
+    std::vector<char> evictable;           ///< per (layer, expert): an unpinned cached expert this round may evict
+
+    void init(strata::core::FileExpertSource* s) {
+        src = s;
+        if (src == nullptr) return;
+        for (int k = 0; k < kSlots; ++k) free.push_back({src->staging_offset(k), strata::kernels::cpu::expert_layout().max_blob});
+    }
+    /// At a round's start: the unpinned cached experts it may evict: in each layer as many as it has candidates to swap
+    /// in (missing experts routed at least twice), the least-routed first, and of those the least-routed overall, as
+    /// many as there are free places.
+    void begin(const strata::core::ExpertSource& s, const std::vector<int32_t>& host_res, const std::vector<float>& usage,
+               int64_t n_expert) {
+        if (src == nullptr) return;
+        evictable.assign(host_res.size(), 0);
+        std::vector<std::pair<float, int32_t>> cold, layer;   // (usage, residency index)
+        for (size_t l0 = 0; l0 < host_res.size(); l0 += (size_t) n_expert) {
+            size_t want = 0;
+            layer.clear();
+            for (size_t i = l0; i < l0 + (size_t) n_expert; ++i) {
+                if (host_res[i] < 0) want += usage[i] >= 2.0f;
+                else if (!s.pinned((int64_t) (i / n_expert), (int64_t) (i % n_expert))) layer.emplace_back(usage[i], (int32_t) i);
+            }
+            const size_t n = std::min(want, layer.size());
+            std::partial_sort(layer.begin(), layer.begin() + (ptrdiff_t) n, layer.end());
+            cold.insert(cold.end(), layer.begin(), layer.begin() + (ptrdiff_t) n);
+        }
+        const size_t n = std::min(cold.size(), free.size());
+        std::partial_sort(cold.begin(), cold.begin() + (ptrdiff_t) n, cold.end());
+        for (size_t j = 0; j < n; ++j) evictable[(size_t) cold[j].second] = 1;
+    }
+    /// Whether a cached expert may be a victim this round.
+    bool victim(const strata::core::ExpertSource& s, int64_t layer, int64_t expert, int64_t n_expert) const {
+        return src == nullptr || s.pinned(layer, expert) || evictable[(size_t) (layer * n_expert + expert)];
+    }
+    /// The copies that put `in` (of `layer`) into `dst` in place of `out`, on `cs`; false when `in` cannot come in now.
+    bool swap(strata::core::ExpertSource& s, int32_t layer, int32_t in, int32_t out, void* dst, cudaStream_t cs,
+              bool& failed) {
+        const uint64_t bytes = strata::kernels::cpu::expert_layout().blob_bytes(layer);
+        const uint8_t* b = s.blob(layer, in);
+        if (b == nullptr) return false;
+        if (src != nullptr && !s.pinned(layer, out)) {
+            if (!s.pinned(layer, in)) return false;
+            size_t best = free.size();   // the smallest free place the blob fits
+            for (size_t j = 0; j < free.size(); ++j)
+                if (free[j].bytes >= bytes && (best == free.size() || free[j].bytes < free[best].bytes)) best = j;
+            if (best == free.size()) return false;
+            const Place at = free[best];
+            free.erase(free.begin() + (ptrdiff_t) best);
+            failed = cudaMemcpyAsync(src->host(at.off), dst, (size_t) bytes, cudaMemcpyDeviceToHost, cs) != cudaSuccess ||
+                     cudaMemcpyAsync(dst, b, (size_t) bytes, cudaMemcpyHostToDevice, cs) != cudaSuccess;
+            inflight.push_back({layer, in, out, at});
+            return true;
+        }
+        failed = cudaMemcpyAsync(dst, b, (size_t) bytes, cudaMemcpyHostToDevice, cs) != cudaSuccess;
+        return true;
+    }
+    /// after the copies have landed (no reader holds a pointer: between windows)
+    void landed() {
+        for (const X& x : inflight) {
+            const uint64_t was = src->pinned_offset(x.layer, x.in);
+            src->place(x.layer, x.out, x.at.off);
+            src->place(x.layer, x.in, strata::core::FileExpertSource::kMapped);
+            free.push_back({was, strata::kernels::cpu::expert_layout().blob_bytes(x.layer)});
+        }
+        inflight.clear();
+    }
+};
+
 /// The pipeline (placement.hpp) from --gpus / --gpu-split.  Without a split the layers go where streaming the experts
 /// that do not fit in VRAM costs least: the split minimizes the time to move every non-resident expert once over
 /// its GPU's own link (what a prompt chunk streams), sum over GPUs of bytes / link bandwidth.  With equal links that
@@ -2950,7 +3032,7 @@ int main(int argc, char** argv) {
         for (const auto& [d, l, e] : cached) push(l, e);
         const uint64_t budget = o.pin_experts_gib >= 0.0 ? (uint64_t) (o.pin_experts_gib * 1073741824.0) : streamed;
         const auto t0 = Clock::now();
-        if (!src.pin(order, budget, 8, err)) {
+        if (!src.pin(order, budget, PinExchange::kSlots, 8, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
@@ -3121,6 +3203,8 @@ int main(int argc, char** argv) {
         }
         // plan v0.3 P6: swaps in flight - (residency index, slot) admitted when their copies have landed
         std::vector<std::pair<int32_t, int32_t>> pending;
+        PinExchange xch;
+        xch.init(o.mmap_experts ? &src : nullptr);
         auto apply_pending = [&](bool wait) {
             if (pending.empty()) return;
             if (!refills.done(wait)) return;
@@ -3131,6 +3215,7 @@ int main(int argc, char** argv) {
             }
             for (const auto& [i, slot] : pending) host_res[(size_t) i] = slot;
             pending.clear();
+            xch.landed();
             if (d_res != nullptr)
                 cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
         };
@@ -3154,6 +3239,7 @@ int main(int argc, char** argv) {
             struct Swap { float gain; int32_t layer, in, out; };
             std::vector<Swap> swaps;
             std::vector<std::pair<float, int32_t>> cand, vict;
+            xch.begin(*srcp, host_res, drive.d.usage, g.n_expert);
             for (int64_t l = 0; l < g.n_layers; ++l) {
                 cand.clear();
                 vict.clear();
@@ -3161,7 +3247,7 @@ int main(int argc, char** argv) {
                 const int32_t* r = host_res.data() + l * g.n_expert;
                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
                     if (r[e] < 0) { if (u[e] >= 2.0f) cand.emplace_back(u[e], e); }
-                    else if (srcp->pinned(l, e)) vict.emplace_back(u[e], e);   // low RAM: without a pinned copy it stays cached
+                    else if (xch.victim(*srcp, l, e, g.n_expert)) vict.emplace_back(u[e], e);
                 }
                 if (cand.empty() || vict.empty()) continue;
                 std::sort(cand.begin(), cand.end(), [](auto& a, auto& b) { return a.first > b.first; });
@@ -3178,11 +3264,11 @@ int main(int argc, char** argv) {
             for (const Swap& s : swaps) {
                 const size_t in = (size_t) s.layer * g.n_expert + s.in, out = (size_t) s.layer * g.n_expert + s.out;
                 const int32_t slot = host_res[out];
-                const uint8_t* b = srcp->blob(s.layer, s.in);
-                if (slot < 0 || b == nullptr ||
-                    cudaMemcpyAsync(tier.device_slot(slot), b, (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer),
-                                    cudaMemcpyHostToDevice, refills.stream(tier.stage_of_slot(slot))) != cudaSuccess)
-                    return false;
+                if (slot < 0) return false;
+                const int st = tier.stage_of_slot(slot);
+                bool failed = false;
+                if (!xch.swap(*srcp, s.layer, s.in, s.out, tier.device_slot(slot), refills.stream(st), failed)) continue;
+                if (failed) return false;
                 host_res[out] = strata::core::kNotResident;   // evicted now: the CPU computes it meanwhile
                 pending.emplace_back((int32_t) in, slot);      // resident once the copy has landed
             }
@@ -4352,6 +4438,8 @@ int main(int argc, char** argv) {
         }
         // plan v0.3 P6: swaps in flight - (residency index, slot) admitted when their copies have landed
         std::vector<std::pair<int32_t, int32_t>> pending;
+        PinExchange xch;
+        xch.init(o.mmap_experts ? &src : nullptr);
         auto apply_pending = [&](bool wait) {
             if (pending.empty()) return;
             if (!refills.done(wait)) return;
@@ -4362,6 +4450,7 @@ int main(int argc, char** argv) {
             }
             for (const auto& [i, slot] : pending) host_res[(size_t) i] = slot;
             pending.clear();
+            xch.landed();
             if (d_res != nullptr)
                 cudaMemcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
         };
@@ -4396,6 +4485,7 @@ int main(int argc, char** argv) {
             struct Swap { float gain; int32_t layer, in, out; };
             std::vector<Swap> swaps;
             std::vector<std::pair<float, int32_t>> cand, vict;
+            xch.begin(*srcp, host_res, drive.d.usage, g.n_expert);
             for (int64_t l = 0; l < g.n_layers; ++l) {
                 cand.clear();
                 vict.clear();
@@ -4403,7 +4493,7 @@ int main(int argc, char** argv) {
                 const int32_t* r = host_res.data() + l * g.n_expert;
                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
                     if (r[e] < 0) { if (u[e] >= 2.0f) cand.emplace_back(u[e], e); }
-                    else if (srcp->pinned(l, e)) vict.emplace_back(u[e], e);   // low RAM: without a pinned copy it stays cached
+                    else if (xch.victim(*srcp, l, e, g.n_expert)) vict.emplace_back(u[e], e);
                 }
                 if (cand.empty() || vict.empty()) continue;
                 std::sort(cand.begin(), cand.end(), [](auto& a, auto& b) { return a.first > b.first; });
@@ -4417,23 +4507,26 @@ int main(int argc, char** argv) {
             }
             std::sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
             if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
+            int64_t applied = 0;
             for (const Swap& s : swaps) {
                 const size_t in = (size_t) s.layer * g.n_expert + s.in, out = (size_t) s.layer * g.n_expert + s.out;
                 const int32_t slot = host_res[out];
-                const uint8_t* b = srcp->blob(s.layer, s.in);
-                // asynchronous: the copies run while the MTP drafts; the next window waits for them
-                if (slot < 0 || b == nullptr ||
-                    cudaMemcpyAsync(tier.device_slot(slot), b, (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer),
-                                    cudaMemcpyHostToDevice, refills.stream(tier.stage_of_slot(slot))) != cudaSuccess) {
+                // asynchronous: the copies run while the MTP drafts; the next window admits them once they have landed
+                bool failed = slot < 0;
+                const int st = failed ? 0 : tier.stage_of_slot(slot);
+                if (!failed && !xch.swap(*srcp, s.layer, s.in, s.out, tier.device_slot(slot), refills.stream(st), failed))
+                    continue;
+                if (failed) {
                     std::fprintf(stderr, "strata generate: an adaptive refill failed\n");
                     return false;
                 }
+                ++applied;
                 host_res[out] = strata::core::kNotResident;   // evicted now: the CPU computes it meanwhile
                 pending.emplace_back((int32_t) in, slot);      // resident once the copy has landed
             }
-            if (!swaps.empty()) refills.record();
+            if (applied > 0) refills.record();
             for (float& v : drive.d.usage) v *= 0.7f;
-            swaps_total += (int64_t) swaps.size();
+            swaps_total += applied;
             ms_adapt += std::chrono::duration<double, std::milli>(Clock::now() - ta).count();
             return true;
         };
