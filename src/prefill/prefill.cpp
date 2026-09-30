@@ -1192,10 +1192,10 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             // the grid reaches the batch's last query's n_bid (they rise with the position)
                             const int64_t active = (int64_t) m.steps_host[(size_t) ((t0 + nb - 1) * strata::kernels::kStepCount +
                                                                                     strata::kernels::kStepNBid)] + 1;
-                            strata::kernels::qsa_block_scores_tiled(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512, steps0,
-                                                                    nb, m.max_blocks, s, m.sel_scores, m.cs, active);
+                            strata::kernels::qsa_block_scores_tc(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512, steps0, nb,
+                                                                 m.max_blocks, s, m.sel_scores, m.cs, active);
                             strata::kernels::qsa_block_topk(m.sel_scores, steps0, nb, m.max_blocks, m.cap, s,
-                                                            m.sel_ids + t0 * m.cap, m.cs);
+                                                            m.sel_ids + t0 * m.cap, m.cs, active);
                         }
                         // STRATA_IDX_FP16_CHECK: would FP16 pooled indexer keys select the same cells? (the KV-streaming
                         // design's last question). Every query is selected again from the pooled keys and `dead` rounded
@@ -1219,8 +1219,8 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             for (int64_t t0 = 0; t0 < T; t0 += m.sel_batch) {
                                 const int64_t nb = std::min(m.sel_batch, T - t0);
                                 const int32_t* steps0 = m.steps_dev + t0 * strata::kernels::kStepCount;
-                                strata::kernels::qsa_block_scores_tiled(pooled16, dead16, m.q_idx + t0 * 512, steps0, nb,
-                                                                        m.max_blocks, s, m.sel_scores, m.cs, m.max_blocks);
+                                strata::kernels::qsa_block_scores_tc(pooled16, dead16, m.q_idx + t0 * 512, steps0, nb,
+                                                                     m.max_blocks, s, m.sel_scores, m.cs, m.max_blocks);
                                 strata::kernels::qsa_block_topk(m.sel_scores, steps0, nb, m.max_blocks, m.cap, s,
                                                                 ids16 + t0 * m.cap, m.cs);
                             }
