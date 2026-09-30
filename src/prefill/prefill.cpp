@@ -1,5 +1,6 @@
 // src/prefill/prefill.cpp - see include/strata/prefill/prefill.hpp.
 #include "strata/prefill/prefill.hpp"
+#include "strata/core/mtp.hpp"
 #include "strata/core/progress.hpp"
 
 #include "strata/core/layout.hpp"
@@ -15,6 +16,10 @@
 #include "strata/kernels/kv_stream.hpp"
 #include "strata/kernels/cvec.hpp"
 #include "strata/kernels/kv_q4.hpp"
+#include "strata/kernels/kv_q8.hpp"
+#include "strata/kernels/native_qsa.hpp"
+#include "strata/kernels/native_rope.hpp"
+#include "strata/kernels/rope.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/native_head.hpp"
 #include "strata/kernels/verify_kernels.hpp"
@@ -662,6 +667,154 @@ bool Prefill::relayout(int64_t chunk, const std::vector<Borrow>& borrow, std::st
 }
 
 int64_t Prefill::chunk() const { return parts_.front()->T; }
+bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0,
+                       std::string& err) {
+    using namespace strata::kernels;
+    Impl& m = *parts_.back();
+    const core::ModelGeometry& g = *m.g;
+    const int64_t HC = g.hc, HCN = HC * N, NKV = g.n_head_kv, HD = g.head_dim, KV = NKV * HD, LRk = g.hc_lr;
+    // cells the drafter's window can never reach again need no K/V
+    const int64_t skip = std::min(n, std::max<int64_t>(0, mtp.first_needed() - cell0));
+    R_rows += (size_t) skip * HCN;
+    next_tokens += skip;
+    cell0 += skip;
+    n -= skip;
+    if (n <= 0) return true;
+    core::DeviceGuard dg(m.device);
+    const auto t0 = Clock::now();
+    if (!mtp.idle(err)) return false;   // the drafter's own stream before this writes its K/V
+    core::QsaState& st = mtp.kv_state_rw();
+    QsaShapes s = qsa_real_shapes();
+    s.n_head = g.n_head; s.n_head_kv = NKV; s.head_dim = HD; s.idx_n_head = g.idx_q_heads; s.idx_dim = g.idx_key_dim;
+    const int Q8 = 8;   // GGML_TYPE_Q8_0
+    const auto al = [](uint64_t x) { return (x + 255) / 256 * 256; };
+    // per row: emb, en, e2, mixed (N); hn, h2, R, gated (HCN); xn16 (HCN bf16); lo (LR) and lo16; rs (HC); K and V;
+    // q8_1 activations and identity rows (HC rows); the token, step and K position records
+    const auto bytes = [&](uint64_t B) {
+        return al(B * N * 4) * 4 + al(B * HCN * 4) * 4 + al(B * HCN * 2) + al(B * LRk * 4) + al(B * LRk * 2) +
+               al(B * HC * 4) + al(B * KV * 4) * 2 + al(mmq::q8_bytes((int64_t) (B * HC), N)) + al(B * HC * 4) + 256 +
+               al(B * (uint64_t) (1 + kStepCount + NKV) * 4);
+    };
+    int64_t B = std::min<int64_t>(n, 4096);
+    while (B > 64 && bytes((uint64_t) B) > m.region_bytes) B /= 2;
+    if (bytes((uint64_t) B) > m.region_bytes) { err = "prefill: the draft layer's K/V pass does not fit the scratch"; return false; }
+    uint8_t* q = m.region;
+    auto take = [&](uint64_t b) { uint8_t* r = q; q += al(b); return r; };
+    float* emb = (float*) take((uint64_t) B * N * 4);
+    float* en = (float*) take((uint64_t) B * N * 4);
+    float* e2 = (float*) take((uint64_t) B * N * 4);
+    float* mixed = (float*) take((uint64_t) B * N * 4);
+    float* hn = (float*) take((uint64_t) B * HCN * 4);
+    float* h2 = (float*) take((uint64_t) B * HCN * 4);
+    float* R = (float*) take((uint64_t) B * HCN * 4);
+    float* gated = (float*) take((uint64_t) B * HCN * 4);
+    uint16_t* xn16 = (uint16_t*) take((uint64_t) B * HCN * 2);
+    float* lo = (float*) take((uint64_t) B * LRk * 4);
+    uint16_t* lo16 = (uint16_t*) take((uint64_t) B * LRk * 2);
+    float* rs = (float*) take((uint64_t) B * HC * 4);
+    float* kcur = (float*) take((uint64_t) B * KV * 4);
+    float* vcur = (float*) take((uint64_t) B * KV * 4);
+    void* xq = take(mmq::q8_bytes((int64_t) (B * HC), N));
+    int32_t* ids = (int32_t*) take((uint64_t) B * HC * 4);
+    int32_t* bounds = (int32_t*) take(256);
+    int32_t* rec_dev = (int32_t*) take((uint64_t) B * (1 + kStepCount + NKV) * 4);
+    if (!m.mmq_ctx) m.mmq_ctx = std::make_unique<mmq::Context>();
+    mmq::iota(ids, (int64_t) (B * HC), m.cs);
+    const float* w_ne = mtp.f32("pre_fc_norm_embedding.weight");
+    const void* w_fe = mtp.q8("fc_embedding.weight");
+    const float* w_nh = mtp.f32("pre_fc_norm_hidden.weight");
+    const void* w_fh = mtp.q8("fc_hidden.weight");
+    const float* w_hn = mtp.f32("attn_hyper_connection.hc_norm.weight");
+    const uint16_t* w_dn = mtp.bf16("attn_hyper_connection.input_mix_weight_down.weight");
+    const uint16_t* w_up = mtp.bf16("attn_hyper_connection.input_mix_weight_up.weight");
+    const void* w_k = mtp.q8("self_attn.k_proj.weight");
+    const void* w_v = mtp.q8("self_attn.v_proj.weight");
+    const float* w_kn = mtp.f32("self_attn.k_norm.weight");
+    std::vector<int32_t> rec((size_t) (B * (1 + kStepCount + NKV)));
+    try {
+        for (int64_t c = 0; c < n; c += B) {
+            const int b = (int) std::min<int64_t>(B, n - c);
+            // the rows' token, step and K position records
+            int32_t* tk = rec.data();
+            int32_t* stp = tk + b;
+            int32_t* pk = stp + (int64_t) kStepCount * b;
+            for (int i = 0; i < b; ++i) {
+                const int64_t cell = cell0 + c + i;
+                tk[i] = next_tokens[c + i];
+                int32_t* sr = stp + (int64_t) i * kStepCount;
+                for (int j = 0; j < kStepCount; ++j) sr[j] = 0;
+                sr[0] = (int32_t) cell;
+                sr[1] = (int32_t) (cell + 1);
+                sr[2] = (int32_t) ((cell + 1) / 4);
+                sr[3] = (int32_t) (cell + 1);
+                for (int64_t h = 0; h < NKV; ++h) pk[i * NKV + h] = (int32_t) cell;
+            }
+            if (cudaMemcpyAsync(rec_dev, rec.data(), (size_t) b * (1 + kStepCount + NKV) * 4, cudaMemcpyHostToDevice, m.cs) !=
+                cudaSuccess) {
+                err = "prefill: the draft layer's records upload failed";
+                return false;
+            }
+            const int32_t* d_tk = rec_dev;
+            const int32_t* d_stp = d_tk + b;
+            const int32_t* d_pk = d_stp + (int64_t) kStepCount * b;
+            // ---- the two input branches
+            if (const core::NativeEmbed* ne = core::native_embed()) {
+                ne->gather_dev(d_tk, b, emb, m.cs);
+            } else {
+                const core::WeightRef* we = m.wt->find("token_embd.weight");
+                if (!we) { err = "prefill: token_embd.weight is missing"; return false; }
+                const auto* codes = (const uint8_t*) we->data;
+                const auto* scales = (const float*) (codes + we->codes_bytes);
+                const auto* offsets = we->has_offset ? (const float*) (codes + we->codes_bytes + we->scales_bytes) : nullptr;
+                embedding_gather_dev(codes, scales, offsets, d_tk, b, we->ne0, we->code_bits, we->code_bias, we->group_elems,
+                                     (uint64_t) (we->ne0 / (8 / we->code_bits)), (uint64_t) (we->ne0 / we->group_elems), emb,
+                                     m.cs);
+            }
+            native_qsa_rms_norm_weighted(emb, w_ne, en, (int) N, b, EPS, m.cs);
+            mmq::quantize(en, nullptr, xq, Q8, N, N, b, m.cs);
+            m.mmq_ctx->dense(w_fe, Q8, N, N, xq, b, ids, bounds, e2, N, m.cs);
+            native_qsa_rms_norm_weighted(R_rows + (size_t) c * HCN, w_nh, hn, (int) HCN, b, EPS, m.cs);
+            mmq::quantize(hn, nullptr, xq, Q8, N, N, b * HC, m.cs);
+            m.mmq_ctx->dense(w_fh, Q8, N, N, xq, b * HC, ids, bounds, h2, N, m.cs);
+            add_streams_broadcast(h2, e2, R, N, (int) HC, b, m.cs);
+            // ---- the attention hyper-connection's read: its mixed input only (the pass writes nothing back)
+            gr_norm(R, w_hn, EPS, rs, xn16, b, m.cs);
+            m.gemm.bf16(xn16, w_dn, lo, b, LRk, HCN);
+            gr_silu(lo, lo16, b, m.cs);
+            m.gemm.bf16(lo16, w_up, gated, b, HCN, LRk);
+            gr_mix(R, w_hn, rs, gated, mixed, nullptr, b, m.cs, nullptr);
+            // ---- K and V into the layer's own cache
+            mmq::quantize(mixed, nullptr, xq, Q8, N, N, b, m.cs);
+            m.mmq_ctx->dense(w_k, Q8, KV, N, xq, b, ids, bounds, kcur, KV, m.cs);
+            m.mmq_ctx->dense(w_v, Q8, KV, N, xq, b, ids, bounds, vcur, KV, m.cs);
+            native_qsa_rms_norm_weighted(kcur, w_kn, kcur, (int) HD, (int) (b * NKV), EPS, m.cs);
+            if (native_rope_enabled()) native_rope_apply(kcur, kcur, (int) (b * NKV), (int) HD, (int) s.n_rot, (float) qsa_freq_base(), d_pk, m.cs);
+            else rope_neox_apply(kcur, kcur, (int) (b * NKV), (int) HD, (int) s.n_rot, st.cos_tab, st.sin_tab, d_pk, m.cs);
+            if (st.kv_q4) {   // Q4_0 KV (kv_q4.hpp): rotated K and V
+                fwht256_inplace_cuda(kcur, b * NKV, m.cs);
+                fwht256_inplace_cuda(vcur, b * NKV, m.cs);
+                for (int t = 0; t < b; ++t)
+                    kv_append_q4_step(st.k_q4, st.v_q4, st.page_table, d_stp + t * kStepCount, kcur + t * KV, vcur + t * KV,
+                                      s, m.cs, &st.host);
+            } else if (st.kv_int8) {
+                kv_append_q8_step(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, d_stp, kcur, vcur, s, m.cs, &st.host, b);
+            } else {
+                kv_append_step(st.k_pool, st.v_pool, st.page_table, d_stp, kcur, vcur, s, m.cs, &st.host, b);
+            }
+            // the records are rewritten for the next slice
+            if (cudaStreamSynchronize(m.cs) != cudaSuccess) {
+                err = std::string("prefill: the draft layer's K/V: ") + cudaGetErrorString(cudaGetLastError());
+                return false;
+            }
+        }
+    } catch (const std::exception& e) {
+        err = std::string("prefill: the draft layer's K/V: ") + e.what();
+        return false;
+    }
+    mtp.ms_prefill += ms_since(t0);
+    return true;
+}
+
 void Prefill::set_pinned_share(double share) { g_pinned_share = share; }
 double Prefill::pinned_share() { return g_pinned_share; }
 
@@ -1689,7 +1842,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     err = std::string("prefill: ") + cudaGetErrorString(cudaGetLastError());
                     return false;
                 }
-                if (!on_chunk(m.R, T, p0, m.region, (size_t) m.region_bytes, err)) return false;
+                if (!on_chunk(m.R, T, p0, err)) return false;
             }
             signal(done, pi, k + 1);
             if (pi == 0) hold = false;

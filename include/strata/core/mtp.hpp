@@ -31,7 +31,6 @@
 #include <string>
 #include <vector>
 
-namespace strata::prefill::mmq { class Context; }
 
 namespace strata::core {
 
@@ -62,11 +61,19 @@ public:
     bool bind(const WeightTable& wt, const NativeHead* head, const float* window_R, std::string& err);
 
     /// Prompt cells [cell0, cell0 + n): residual rows `R_rows` (device, hc*n_embd each) and `next_tokens` (host,
-    /// the token at position cell+1).  With `scratch` (device memory of this GPU, idle for the call) that holds at
-    /// least 64 rows' buffers, the rows run as many at a time as it holds, the projections through MMQ; otherwise
-    /// the captured graphs run them in batches of up to max_t rows.
-    bool prefill(const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err,
-                 void* scratch = nullptr, size_t scratch_bytes = 0);
+    /// the token at position cell+1), through the captured graphs in batches of up to max_t rows.  (The prompt path
+    /// builds a chunk's K/V itself: Prefill::draft_kv.)
+    bool prefill(const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err);
+
+    /// For Prefill::draft_kv: the layer's tensors, its K/V state, its GPU, the first cell its window can still reach,
+    /// and its stream drained (the prompt path then writes its K/V on its own stream).
+    const float* f32(const char* name) const;
+    const uint16_t* bf16(const char* name) const;
+    const void* q8(const char* name) const;
+    QsaState& kv_state_rw() { return st_; }
+    int device() const { return device_; }
+    int64_t first_needed() const { return (window_ > 0 && prompt_len_ > 0) ? prompt_len_ - window_ - 64 : 0; }
+    bool idle(std::string& err);
 
     /// One round: catch-up over T cells from `p` (rows = the window's final residuals, `tokens` = the window's
     /// argmaxes: row t pairs R_{p+t} with the token at p+t+1), then the draft chain from row `a` (the last
@@ -86,15 +93,9 @@ public:
 private:
     bool record_forward(int T, int step_row0, cudaStream_t cs, std::string& err);
     bool capture_prefill(int T, std::string& err);
-    bool prefill_rows(const float* R_rows, const int32_t* tok, const int32_t* step, const int32_t* pos_kv, int64_t n,
-                      uint8_t* scratch, int64_t rows, std::string& err);
-    static uint64_t prefill_rows_bytes(const ModelGeometry& g, int64_t rows);
     bool capture_round(int T, std::string& err);
     bool capture_step(int j, std::string& err);
     cudaGraphExec_t step_exec_[9] = {};
-    const float* f32(const char* name) const;
-    const uint16_t* bf16(const char* name) const;
-    const void* q8(const char* name) const;
 
     const ModelGeometry* g_ = nullptr;
     SessionState* ss_ = nullptr;
@@ -110,7 +111,6 @@ private:
     cudaGraphExec_t prefill_exec_[9] = {};
     int32_t* pf_dev_ = nullptr;   ///< a prompt's rows' token / step / position records, uploaded at once
     int64_t pf_cap_ = 0;          ///< its capacity in ints
-    std::unique_ptr<strata::prefill::mmq::Context> mmq_;   ///< the prompt pass's MMQ launches
     cudaGraphExec_t round_exec_[9] = {};
 
     struct Tensor { std::string name, kind; int64_t rows = 0, cols = 0; uint64_t off = 0, bytes = 0; };

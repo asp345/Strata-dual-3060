@@ -24,7 +24,6 @@
 #include "strata/kernels/sampler.hpp"
 #include "strata/kernels/shared_expert.hpp"
 #include "strata/kernels/verify_kernels.hpp"
-#include "strata/prefill/moe_mmq.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -529,124 +528,16 @@ void MtpDrafter::kv_restore(int64_t upto) {
     cudaStreamSynchronize(cs_);
 }
 
-uint64_t MtpDrafter::prefill_rows_bytes(const ModelGeometry& g, int64_t rows) {
-    const uint64_t B = (uint64_t) rows, N = (uint64_t) g.n_embd, HC = (uint64_t) g.hc, KV = (uint64_t) (g.n_head_kv * g.head_dim);
-    const auto al = [](uint64_t x) { return (x + 255) / 256 * 256; };
-    return al(B * N * 4) * 4                                                       // emb, en, e2, mixed
-         + al(B * HC * N * 4) * 3                                                  // hn, h2, R
-         + al(B * (uint64_t) g.hc_lr * 4) + al(B * HC * 4) * 2                     // lo, rs, inj
-         + al(B * KV * 4) * 2                                                      // kcur, vcur
-         + al(strata::prefill::mmq::q8_bytes((int64_t) (B * HC), (int64_t) N))    // q8_1 activations
-         + al(B * HC * 4) + 256                                                    // the identity rows, the bounds
-         + al((uint64_t) strata::kernels::fused_gr_multi_scratch_floats(strata::kernels::kFusedGrMaxT) * 4);
+bool MtpDrafter::idle(std::string& err) {
+    DeviceGuard dg(device_);
+    if (cudaStreamSynchronize(cs_) == cudaSuccess) return true;
+    err = std::string("mtp: ") + cudaGetErrorString(cudaGetLastError());
+    return false;
 }
 
-// K/V only for `n` rows whose records (token, step, K positions) are on the device, `rows` at a time in `scratch`:
-// the graphs' MMVQ takes at most 8 rows and reads a weight again for every group; MMQ reads it once per slice.
-bool MtpDrafter::prefill_rows(const float* R_rows, const int32_t* tok, const int32_t* step, const int32_t* pos_kv,
-                              int64_t n, uint8_t* scratch, int64_t rows, std::string& err) {
-    using namespace strata::kernels;
-    namespace mmq = strata::prefill::mmq;
-    const ModelGeometry& g = *g_;
-    const int64_t N = g.n_embd, HC = g.hc, HCN = HC * N, NKV = g.n_head_kv, HD = g.head_dim, KV = NKV * HD;
-    const QsaShapes s = shapes_of(g);
-    const uint64_t B = (uint64_t) rows;
-    uint8_t* p = scratch;
-    auto take = [&](uint64_t bytes) { uint8_t* r = p; p += (bytes + 255) / 256 * 256; return r; };
-    float* emb = (float*) take(B * N * 4);
-    float* en = (float*) take(B * N * 4);
-    float* e2 = (float*) take(B * N * 4);
-    float* mixed = (float*) take(B * N * 4);
-    float* hn = (float*) take(B * HCN * 4);
-    float* h2 = (float*) take(B * HCN * 4);
-    float* R = (float*) take(B * HCN * 4);
-    float* lo = (float*) take(B * (uint64_t) g.hc_lr * 4);
-    float* rs = (float*) take(B * HC * 4);
-    float* inj = (float*) take(B * HC * 4);
-    float* kcur = (float*) take(B * KV * 4);
-    float* vcur = (float*) take(B * KV * 4);
-    void* xq = take(mmq::q8_bytes((int64_t) (B * HC), N));
-    int32_t* ids = (int32_t*) take(B * HC * 4);
-    int32_t* bounds = (int32_t*) take(256);
-    float* xn = (float*) take((uint64_t) fused_gr_multi_scratch_floats(kFusedGrMaxT) * 4);
-    if (!mmq_) mmq_ = std::make_unique<mmq::Context>();
-    mmq::iota(ids, (int64_t) (B * HC), cs_);
-    const int Q8 = GGML_Q8_0;
-    try {
-        for (int64_t c = 0; c < n; c += rows) {
-            const int b = (int) std::min<int64_t>(rows, n - c);
-            // ---- the two input branches
-            if (const NativeEmbed* ne = native_embed()) {
-                ne->gather_dev(tok + c, b, emb, cs_);
-            } else {
-                const WeightRef* we = wt_->find("token_embd.weight");
-                if (!we) { err = "mtp: token_embd.weight is missing"; return false; }
-                const auto* codes = (const uint8_t*) we->data;
-                const auto* scales = (const float*) (codes + we->codes_bytes);
-                const auto* offsets = we->has_offset ? (const float*) (codes + we->codes_bytes + we->scales_bytes) : nullptr;
-                embedding_gather_dev(codes, scales, offsets, tok + c, b, we->ne0, we->code_bits, we->code_bias,
-                                     we->group_elems, (uint64_t) (we->ne0 / (8 / we->code_bits)),
-                                     (uint64_t) (we->ne0 / we->group_elems), emb, cs_);
-            }
-            native_qsa_rms_norm_weighted(emb, f32("pre_fc_norm_embedding.weight"), en, (int) N, b, EPS, cs_);
-            mmq::quantize(en, nullptr, xq, Q8, N, N, b, cs_);
-            mmq_->dense(q8("fc_embedding.weight"), Q8, N, N, xq, b, ids, bounds, e2, N, cs_);
-            native_qsa_rms_norm_weighted(R_rows + (size_t) c * HCN, f32("pre_fc_norm_hidden.weight"), hn, (int) HCN, b, EPS, cs_);
-            mmq::quantize(hn, nullptr, xq, Q8, N, N, b * HC, cs_);
-            mmq_->dense(q8("fc_hidden.weight"), Q8, N, N, xq, b * HC, ids, bounds, h2, N, cs_);
-            add_streams_broadcast(h2, e2, R, N, (int) HC, b, cs_);
-            // ---- the attention hyper-connection, kFusedGrMaxT rows at a time
-            for (int r0 = 0; r0 < b; r0 += kFusedGrMaxT) {
-                const int nr = std::min(kFusedGrMaxT, b - r0);
-                FusedGrArgs fa[kFusedGrMaxT];
-                for (int t = 0; t < nr; ++t) {
-                    const size_t r = (size_t) (r0 + t);
-                    fa[t].R = R + r * HCN; fa[t].R_out = R + r * HCN; fa[t].apply = false;
-                    fa[t].w_norm = f32("attn_hyper_connection.hc_norm.weight");
-                    fa[t].w_down = bf16("attn_hyper_connection.input_mix_weight_down.weight");
-                    fa[t].w_up = bf16("attn_hyper_connection.input_mix_weight_up.weight");
-                    fa[t].w_inject = bf16("attn_hyper_connection.block_inject_weight.weight");
-                    fa[t].eps = EPS; fa[t].lo = lo + r * g.hc_lr; fa[t].rs = rs + r * HC;
-                    fa[t].inject_out = inj + r * HC; fa[t].mixed = mixed + r * N;
-                }
-                fused_gr_read_multi(fa, nr, xn, cs_);
-            }
-            // ---- K and V into the layer's own cache
-            mmq::quantize(mixed, nullptr, xq, Q8, N, N, b, cs_);
-            mmq_->dense(q8("self_attn.k_proj.weight"), Q8, KV, N, xq, b, ids, bounds, kcur, KV, cs_);
-            mmq_->dense(q8("self_attn.v_proj.weight"), Q8, KV, N, xq, b, ids, bounds, vcur, KV, cs_);
-            native_qsa_rms_norm_weighted(kcur, f32("self_attn.k_norm.weight"), kcur, (int) HD, (int) (b * NKV), EPS, cs_);
-            const int32_t* pk = pos_kv + c * NKV;
-            if (native_rope_enabled()) native_rope_apply(kcur, kcur, (int) (b * NKV), (int) HD, (int) s.n_rot, (float) qsa_freq_base(), pk, cs_);
-            else rope_neox_apply(kcur, kcur, (int) (b * NKV), (int) HD, (int) s.n_rot, st_.cos_tab, st_.sin_tab, pk, cs_);
-            if (st_.kv_q4) {   // Q4_0 KV (kv_q4.hpp): rotated K and V
-                fwht256_inplace_cuda(kcur, b * NKV, cs_);
-                fwht256_inplace_cuda(vcur, b * NKV, cs_);
-            }
-            const int32_t* st = step + c * kStepCount;
-            if (st_.kv_q4) {
-                for (int t = 0; t < b; ++t)
-                    kv_append_q4_step(st_.k_q4, st_.v_q4, st_.page_table, st + t * kStepCount, kcur + t * KV, vcur + t * KV,
-                                      s, cs_, &st_.host);
-            } else if (st_.kv_int8) {
-                kv_append_q8_step(st_.k_q, st_.v_q, st_.k_scale, st_.v_scale, st_.page_table, st, kcur, vcur, s, cs_,
-                                  &st_.host, b);
-            } else {
-                kv_append_step(st_.k_pool, st_.v_pool, st_.page_table, st, kcur, vcur, s, cs_, &st_.host, b);
-            }
-        }
-    } catch (const std::exception& e) {
-        err = std::string("mtp prefill: ") + e.what();
-        return false;
-    }
-    return true;
-}
-
-bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err,
-                         void* scratch, size_t scratch_bytes) {
+bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err) {
     // cells the window can never reach again need no K/V
-    const int64_t first_needed = (window_ > 0 && prompt_len_ > 0) ? prompt_len_ - window_ - 64 : 0;
-    const int64_t skip = std::min(n, std::max<int64_t>(0, first_needed - cell0));
+    const int64_t skip = std::min(n, std::max<int64_t>(0, first_needed() - cell0));
     R_rows += (size_t) skip * g_->hc * g_->n_embd;
     next_tokens += skip;
     cell0 += skip;
@@ -656,7 +547,7 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
     const Clock::time_point t0 = Clock::now();
     const int64_t HCN = g_->hc * g_->n_embd;
     // every row's token / step / position records uploaded at once
-    const int64_t NH = g_->n_head, NKV = g_->n_head_kv, per_row = 1 + 4 + NH + NKV;
+    const int64_t NH = g_->n_head, per_row = 1 + 4 + NH;
     if (pf_cap_ < n * per_row) {
         if (pf_dev_) cudaFree(pf_dev_);
         pf_dev_ = nullptr;
@@ -671,7 +562,6 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
     int32_t* tk = rec.data();
     int32_t* stp = tk + n;
     int32_t* ps = stp + 4 * n;
-    int32_t* pk = ps + NH * n;
     for (int64_t i = 0; i < n; ++i) {
         const int64_t cell = cell0 + i;
         tk[i] = next_tokens[i];
@@ -680,7 +570,6 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
         stp[i * 4 + 2] = (int32_t) ((cell + 1) / 4);
         stp[i * 4 + 3] = (int32_t) (cell + 1);
         for (int64_t h = 0; h < NH; ++h) ps[i * NH + h] = (int32_t) cell;
-        for (int64_t h = 0; h < NKV; ++h) pk[i * NKV + h] = (int32_t) cell;
     }
     if (cudaMemcpyAsync(pf_dev_, rec.data(), rec.size() * sizeof(int32_t), cudaMemcpyHostToDevice, cs_) != cudaSuccess) {
         err = "mtp prefill: the input records upload failed";
@@ -689,28 +578,18 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
     const int32_t* d_tk = pf_dev_;
     const int32_t* d_stp = d_tk + n;
     const int32_t* d_ps = d_stp + 4 * n;
-    const int32_t* d_pk = d_ps + NH * n;
-    int64_t rows = 0;
-    if (scratch != nullptr) {
-        rows = std::min<int64_t>(n, 4096);
-        while (rows >= 64 && prefill_rows_bytes(*g_, rows) > scratch_bytes) rows /= 2;
-    }
-    if (rows >= 64) {
-        if (!prefill_rows(R_rows, d_tk, d_stp, d_pk, n, (uint8_t*) scratch, rows, err)) return false;
-    } else {
-        // each group of <= max_t rows: device copies and a graph on the one stream
-        for (int64_t c = 0; c < n; c += max_t_) {
-            const int T = (int) std::min<int64_t>(max_t_, n - c);
-            if (!capture_prefill(T, err)) return false;
-            if (cudaMemcpyAsync(tok_, d_tk + c, (size_t) T * 4, cudaMemcpyDeviceToDevice, cs_) != cudaSuccess ||
-                cudaMemcpyAsync(step_, d_stp + c * 4, (size_t) T * 16, cudaMemcpyDeviceToDevice, cs_) != cudaSuccess ||
-                cudaMemcpyAsync(pos_, d_ps + c * NH, (size_t) (T * NH) * 4, cudaMemcpyDeviceToDevice, cs_) != cudaSuccess ||
-                cudaMemcpyAsync(Rin_, R_rows + (size_t) c * HCN, (size_t) T * HCN * sizeof(float), cudaMemcpyDeviceToDevice,
-                                cs_) != cudaSuccess ||
-                cudaGraphLaunch(prefill_exec_[T], cs_) != cudaSuccess) {
-                err = std::string("mtp prefill: ") + cudaGetErrorString(cudaGetLastError());
-                return false;
-            }
+    // each group of <= max_t rows: device copies and a graph on the one stream
+    for (int64_t c = 0; c < n; c += max_t_) {
+        const int T = (int) std::min<int64_t>(max_t_, n - c);
+        if (!capture_prefill(T, err)) return false;
+        if (cudaMemcpyAsync(tok_, d_tk + c, (size_t) T * 4, cudaMemcpyDeviceToDevice, cs_) != cudaSuccess ||
+            cudaMemcpyAsync(step_, d_stp + c * 4, (size_t) T * 16, cudaMemcpyDeviceToDevice, cs_) != cudaSuccess ||
+            cudaMemcpyAsync(pos_, d_ps + c * NH, (size_t) (T * NH) * 4, cudaMemcpyDeviceToDevice, cs_) != cudaSuccess ||
+            cudaMemcpyAsync(Rin_, R_rows + (size_t) c * HCN, (size_t) T * HCN * sizeof(float), cudaMemcpyDeviceToDevice,
+                            cs_) != cudaSuccess ||
+            cudaGraphLaunch(prefill_exec_[T], cs_) != cudaSuccess) {
+            err = std::string("mtp prefill: ") + cudaGetErrorString(cudaGetLastError());
+            return false;
         }
     }
     if (cudaStreamSynchronize(cs_) != cudaSuccess) {

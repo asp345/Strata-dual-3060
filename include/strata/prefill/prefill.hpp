@@ -25,6 +25,8 @@
 #include <string>
 #include <vector>
 
+namespace strata::core { class MtpDrafter; }
+
 namespace strata::prefill {
 
 struct PrefillStats {
@@ -81,9 +83,14 @@ public:
     /// stage's GPU, T x hc*n_embd, valid until the next chunk) and the chunk's first position; the MTP draft layer
     /// builds its K/V from them.  The last stage's stream is synchronized before the call, which comes from that
     /// stage's thread: with more than one GPU the stages before it may be working on the next chunk.
-    /// `scratch`: that GPU's attention/MoE scratch region (`scratch_bytes`), idle until the callback returns.
-    std::function<bool(const float* R_rows, int64_t T, int64_t pos0, void* scratch, size_t scratch_bytes,
-                       std::string& err)> on_chunk;
+    std::function<bool(const float* R_rows, int64_t T, int64_t pos0, std::string& err)> on_chunk;
+
+    /// The MTP draft layer's K/V for prompt cells [cell0, cell0 + n), from `on_chunk`: `R_rows` its rows (device, on
+    /// the last stage's GPU) and `next_tokens` (host) the token at each cell + 1.  Only what the K/V needs runs - the
+    /// input branches, the attention hyper-connection's read, the K/V projections - as many rows at a time as the
+    /// last stage's idle scratch region holds, the projections through MMQ and the read's through the GEMMs.
+    bool draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0,
+                  std::string& err);
 
     /// With more than one GPU: asked, in order, for the end position of every chunk; true = the first stage waits
     /// until every stage has finished that chunk and `on_chunk` returned (where the callback reads every layer's
