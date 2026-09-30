@@ -926,6 +926,7 @@ struct PfTimer {
 }  // namespace
 
 bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err) {
+    err.clear();
     Impl& m0 = *parts_.front();   // the first stage: the embeddings
     Impl& ml = *parts_.back();    // the last stage: the residual the callback gets
     Impl& mp = *parts_[(size_t) core::placement().stage_of(1)];   // layer 1's stage: the PLE
