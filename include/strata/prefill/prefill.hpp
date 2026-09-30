@@ -51,10 +51,11 @@ public:
     struct Borrow { void* base = nullptr; uint64_t bytes = 0; };
 
     /// `host_res`: the static residency table (n_layers x n_expert, global slot or -1) or null; `slot_addr` the
-    /// device address of every slot, on its layer's GPU.  `borrow`: one per pipeline stage, or empty.
+    /// device address of every slot; `slot_first` the first slot of each stage's GPU and the end (an expert in
+    /// another GPU's slots is streamed like a missing one).  `borrow`: one per pipeline stage, or empty.
     bool init(const core::WeightTable& wt, const core::ModelGeometry& g, core::SessionState& ss,
-              core::ExpertSource* src, const uint64_t* slot_addr, const int32_t* host_res, int64_t chunk,
-              std::string& err, const std::vector<Borrow>& borrow = {});
+              core::ExpertSource* src, const uint64_t* slot_addr, const int32_t* host_res, const int32_t* slot_first,
+              int64_t chunk, std::string& err, const std::vector<Borrow>& borrow = {});
 
     /// With borrowed buffers: lay them out again for chunks of `chunk` tokens (at most `init`'s) in `borrow` (one
     /// per stage) - a request lends only the slots its prompt needs.  Called between prompts.

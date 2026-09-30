@@ -278,7 +278,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     // ---- plan v0.3 P6: the GPU's share, decided and published FIRST so the GPU starts while the CPU works.
     // Distinct experts in routing order; resident ones and the last pcie_num/256 of the missed ones go to the GPU.
     const int64_t n = n_tok * k;
-    int32_t kind[128];                     // per entry: -1 CPU, 0 VRAM, 1 PCIe
+    int32_t kind[128];                     // per entry: -1 CPU, 0 VRAM, 1 PCIe, 2 the first GPU's VRAM
     if (d.plan != nullptr && n <= 128 && n <= d.plan->cap) {
         int64_t distinct[128], first_of[128];
         int nd = 0, nmiss = 0;
@@ -295,10 +295,11 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         const int pcie_num = d.pcie_num.empty() ? 0 : d.pcie_num[(size_t) d.layers];
         const bool pcie_ok = pcie_num > 0 && d.src->device_alias(d.layers, 0) != nullptr;
         const int m = pcie_ok ? (nmiss * pcie_num) >> 8 : 0;
-        int miss_rank = 0, groups = 0, entries = 0, fetches = 0;
+        int miss_rank = 0, groups = 0, entries = 0, fetches = 0, eps = 0;
         GpuPlanSink& P = *d.plan;
+        const bool ep = P.ep_counts != nullptr && d.layers >= P.ep_layer0;
         const uint8_t* dma_src[64];
-        int64_t pcie_i0[64];
+        int64_t pcie_i0[64], ep_i0[128];
         for (int q = 0; q < nd; ++q) {
             const int64_t i0 = distinct[q];
             const int32_t e = ids[i0];
@@ -306,7 +307,10 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             unsigned long long ptr = 0;
             if (e >= 0 && e < d.n_expert) {
                 const int32_t slot = d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e];
-                if (slot >= 0) {
+                if (slot >= 0 && ep && slot < P.ep_slot_end) {
+                    kd = 2;
+                    ep_i0[eps++] = i0;
+                } else if (slot >= 0) {
                     kd = 0;
                     ptr = (unsigned long long) d.slot_addr[slot];
                 } else {
@@ -354,6 +358,24 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         P.counts[0] = groups;
         P.counts[1] = entries;
         P.counts[2] = fetches;
+        if (P.ep_counts != nullptr) {
+            int ep_entries = 0;
+            for (int q = 0; q < eps; ++q) {
+                const int64_t i0 = ep_i0[q];
+                P.ep_ptr[q] = (unsigned long long) d.slot_addr[d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) ids[i0]]];
+                P.ep_start[q] = ep_entries;
+                for (int64_t i = i0; i < n; ++i)
+                    if (first_of[i] == i0) {
+                        P.ep_dst[ep_entries] = (int32_t) i;
+                        P.ep_tok[ep_entries] = (int32_t) (i / k);
+                        ++ep_entries;
+                    }
+            }
+            P.ep_start[eps] = ep_entries;
+            P.ep_counts[0] = eps;
+            P.ep_counts[1] = ep_entries;
+            d.ep_experts += eps;
+        }
         std::atomic_thread_fence(std::memory_order_seq_cst);
         pt("publish", fetches);
         if (P.publish) P.publish(P.ctx);
@@ -389,8 +411,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 return;
             }
             if (kind[i] >= 0) {             // the GPU computes this entry (a VRAM hit or a PCIe read)
-                if (kind[i] == 0) ++d.cache_hits;
-                std::memset(row, 0, (size_t) H * sizeof(float));
+                if (kind[i] != 1) ++d.cache_hits;
+                if (kind[i] != 2) std::memset(row, 0, (size_t) H * sizeof(float));   // 2: the first GPU writes the row
                 continue;
             }
             ++d.cache_refused;

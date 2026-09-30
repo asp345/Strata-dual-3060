@@ -86,6 +86,16 @@ struct GpuPlanSink {
     /// kernel reads the mapped arena directly; 2 = a copy kernel stages it inside the graph.  For 1 and 2 `ptr2`
     /// holds the arena's device alias.
     int pcie_mode = 0;
+    /// Expert parallelism (Verifier::set_ep): an entry of a layer >= `ep_layer0` whose slot is below `ep_slot_end`
+    /// is in the first GPU's VRAM and the first GPU computes it.  Its groups go to a second block of the same layout
+    /// (ep_counts [0] groups, [1] entries); the pool leaves its rows to the first GPU.  Null = off.
+    int32_t* ep_counts = nullptr;
+    int32_t* ep_start = nullptr;
+    int32_t* ep_dst = nullptr;
+    int32_t* ep_tok = nullptr;
+    unsigned long long* ep_ptr = nullptr;
+    int64_t ep_layer0 = 0;
+    int32_t ep_slot_end = 0;
 };
 
 /// The adapter's own state.  One per session, reused every layer so the token path allocates nothing (P2.T10).
@@ -209,6 +219,7 @@ struct ExpertDispatch {
     GpuPlanSink* plan = nullptr;
     std::vector<int> pcie_num;
     int64_t pcie_experts = 0;      ///< distinct experts the GPU read over PCIe in verify windows
+    int64_t ep_experts = 0;        ///< distinct experts the first GPU computed for a later GPU's layer
     double ms_plan = 0, ms_actq = 0, ms_jobs = 0, ms_run = 0;   ///< verify-window dispatch sections
     /// Plan v0.3 P6: decayed routing counts per (layer, expert) during decode (sized by the caller; empty = off),
     /// which the driver uses to swap the most-routed missing experts into the VRAM tier between rounds.

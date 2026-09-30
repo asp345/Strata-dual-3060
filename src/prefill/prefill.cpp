@@ -242,6 +242,12 @@ struct Prefill::Impl {
     core::ExpertSource* src = nullptr;
     const uint64_t* slot_addr = nullptr;
     const int32_t* host_res = nullptr;
+    int32_t slot_lo = 0, slot_hi = 0;   // this GPU's slots
+    bool resident(int64_t l, int32_t e) const {
+        if (host_res == nullptr || slot_addr == nullptr) return false;
+        const int32_t s = host_res[(size_t) l * g->n_expert + e];
+        return s >= slot_lo && s < slot_hi;
+    }
     // this part's pipeline stage (placement.hpp): its GPU, its layers [l0, l1), their first GDN / QSA index
     int stage = 0, device = 0;
     int64_t l0 = 0, l1 = 0, gdn0 = 0, qsa0 = 0;
@@ -452,8 +458,8 @@ uint64_t moe_set_bytes(size_t T, int64_t n_expert) {
 }
 
 bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, core::SessionState& ss,
-                   core::ExpertSource* src, const uint64_t* slot_addr, const int32_t* host_res, int64_t chunk,
-                   std::string& err, const std::vector<Borrow>& borrow) {
+                   core::ExpertSource* src, const uint64_t* slot_addr, const int32_t* host_res, const int32_t* slot_first,
+                   int64_t chunk, std::string& err, const std::vector<Borrow>& borrow) {
     if (g.n_embd != N || g.hc != HC || g.hc_lr != LR || g.n_expert < 1 || ss.k != K) {
         err = "prefill: geometry differs from the artifact's"; return false;
     }
@@ -465,6 +471,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         parts_.push_back(std::make_unique<Impl>());
         Impl& m = *parts_.back();
         m.wt = &wt; m.g = &g; m.ss = &ss; m.src = src; m.slot_addr = slot_addr; m.host_res = host_res;
+        if (slot_first != nullptr) { m.slot_lo = slot_first[st]; m.slot_hi = slot_first[st + 1]; }
         m.T = chunk; m.stats = &stats_;
         m.stage = st;
         m.device = pl.device(st);
@@ -960,7 +967,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 for (int64_t l = m.l0; fit && l < m.l1; ++l) {
                     fit = mmq_plan().layer[(size_t) l] != 0;
                     for (int32_t e = 0; fit && e < m.g->n_expert; ++e)
-                        if (!(m.host_res && m.slot_addr && m.host_res[(size_t) l * m.g->n_expert + e] >= 0))
+                        if (!m.resident(l, e))
                             fit = m.src->blob(l, e) != nullptr && m.src->pinned(l, e);
                 }
                 if (fit) helper = parts_[1].get();
@@ -974,7 +981,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 for (int64_t l = m.l0; l < m.l1; ++l) {
                     seq_start[(size_t) l] = sq.size();
                     for (int32_t e = 0; e < m.g->n_expert; ++e) {
-                        if (m.host_res && m.slot_addr && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
+                        if (m.resident(l, e)) continue;
                         const uint8_t* b = m.src->blob(l, e);
                         if (!b) { err = "prefill: expert source has no blob"; return false; }
                         int job = -1;
@@ -1318,7 +1325,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             ++m.cnt[(size_t) e];
                         }
                         auto resident = [&](int32_t e) {
-                            return m.host_res && m.slot_addr && m.host_res[(size_t) l * m.g->n_expert + e] >= 0;
+                            return m.resident(l, e);
                         };
                         std::vector<int32_t> order;
                         for (int32_t e = 0; e < m.g->n_expert; ++e) if (m.cnt[(size_t) e] > 0 && resident(e)) order.push_back(e);
@@ -1436,7 +1443,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             std::vector<Stager::Job> js;
                             for (size_t j = 0; j < order.size(); ++j) {
                                 const int32_t e = order[j];
-                                if (m.host_res && m.slot_addr && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
+                                if (m.resident(l, e)) continue;
                                 if (m.src->pinned(l, e)) continue;
                                 const uint8_t* b = m.src->blob(l, e);
                                 if (!b) { err = "prefill: expert source has no blob"; return false; }
@@ -1448,7 +1455,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         StagerDone stager_done{stream_all || helper ? nullptr : m.stager.get()};
                         auto stage_one = [&](size_t j) -> bool {
                             const int32_t e = order[j];
-                            const bool resident = m.host_res && m.slot_addr && m.host_res[(size_t) l * m.g->n_expert + e] >= 0;
+                            const bool resident = m.resident(l, e);
                             if (resident) return true;
                             const int sl = stage_next;
                             stage_next = (stage_next + 1) % STAGE;

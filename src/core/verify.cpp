@@ -107,6 +107,7 @@ void Verifier::diag(std::FILE* f) const {
     std::fprintf(f, "  verify window: %d tokens at position %lld, host at layer step %u; the GPU rang %u; flags: "
                     "served %u, plan (A) %u, copies (B) %u", last_t_, (long long) last_pos0_, cur_layer_ + 1,
                  rd(h_seq_), rd(h_flag_), rd(h_flagA_), rd(h_flagB_));
+    if (ep_) std::fprintf(f, ", first GPU's plan %u, its rows %u", rd(h_epA_), rd(h_epB_));
     for (size_t s = 0; s < h_hand_flag_.size(); ++s)
         std::fprintf(f, ", stage %zu handed on %u", s, rd(h_hand_flag_[s]));
     std::fprintf(f, "\n");
@@ -129,7 +130,7 @@ Verifier::~Verifier() {
         if (P.arena) cudaFree(P.arena);
     }
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_pos_kv_, h_pos_iq_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_,
-                     h_flagA_, h_plan_, h_flagB_};
+                     h_flagA_, h_plan_, h_flagB_, h_eplan_, h_epA_, h_epB_};
     for (void* h : hosts)
         if (h) cudaFreeHost(h);
     for (void* h : h_hand_) cudaFreeHost(h);
@@ -207,7 +208,9 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         const int64_t i32 = 4 + (cap + 1) + cap + cap;
         const int64_t ptr_off = (i32 + 1) & ~1ll;
         plan_i32_ = ptr_off + 4 * cap + (cap + 1) + 1;
-        if (!mapped((size_t) plan_i32_ * 4 * 2 + 64, (void**) &h_plan_, (void**) &m_plan_)) {
+        if (!mapped((size_t) plan_i32_ * 4 * 2 + 64, (void**) &h_plan_, (void**) &m_plan_) ||
+            !mapped((size_t) plan_i32_ * 4 * 2 + 64, (void**) &h_eplan_, (void**) &m_eplan_) ||
+            !mapped(64, (void**) &h_epA_, (void**) &m_epA_) || !mapped(64, (void**) &h_epB_, (void**) &m_epB_)) {
             err = "verify: mapped plan allocation failed";
             return false;
         }
@@ -713,6 +716,31 @@ bool Verifier::record_window(int T, Part& P, std::string& err) {
         // the residual to the next stage: published to mapped memory, then its flag (ordered by the kernel's fence)
         doorbell_publish(P.R_, nullptr, nullptr, (int64_t) T * HC * N, 0, m_hand_[(size_t) P.stage], nullptr, nullptr,
                          m_hand_flag_[(size_t) P.stage], cs);
+        if (!(ep_ && first)) return true;
+        // expert parallelism: the later layers' entries whose experts are in this GPU's VRAM.  A layer the pool gave
+        // none of them finds another layer's tag in the block and computes nothing.
+        const auto& lay = strata::kernels::cpu::expert_layout();
+        for (int64_t l = sink_.ep_layer0; l < g.n_layers; ++l)
+            for (int grp = 0; grp < G; ++grp) {
+                const int tb = tb_[grp], n = te_[grp] - tb;
+                const uint32_t ring = (uint32_t) (l * G + grp + 1);
+                const int64_t cap = (int64_t) n * K, capx = (int64_t) max_t_ * K;
+                int32_t* pl = P.plan_ + (size_t) grp * (size_t) (plan_i32_ + 16);
+                wait_flag_ge(m_epA_, ring, cs);
+                take_plan(pl, m_eplan_ + (size_t) grp * (size_t) plan_i32_, plan_i32_, (int32_t) ring, cs);
+                const int32_t* p_start = pl + 4;
+                const int32_t* p_dst = p_start + capx + 1;
+                const int32_t* p_tok = p_dst + capx;
+                const unsigned long long* p_ptr = (const unsigned long long*) (pl + (((4 + (capx + 1) + 2 * capx) + 1) & ~1ll));
+                copy_from_mapped_if(P.bo_ + tb * N, m_x_ + tb * N, (int64_t) n * N, pl, cs);
+                quantize_q8_1_rows(P.bo_ + tb * N, n, N, P.nat_xq_ + (size_t) tb * (N / 32) * 36, cs);
+                const auto& f = lay.fmt[(size_t) l];
+                native_expert_grouped(native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff), p_ptr, p_start, pl, p_dst,
+                                      p_tok, cap, cap, P.nat_xq_ + (size_t) tb * (N / 32) * 36, P.hit_scratch_,
+                                      P.hit_out_ + (size_t) tb * K * N, cs);
+                rows_to_mapped(m_ymiss_ + (size_t) tb * K * N, P.hit_out_ + (size_t) tb * K * N, p_dst, pl + 1, cap, N, cs);
+                set_flag(m_epB_, ring, cs);
+            }
         return true;
     }
 
@@ -892,6 +920,10 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     *(volatile uint32_t*) h_flag_ = 0;
     *(volatile uint32_t*) h_flagA_ = 0;
     *(volatile uint32_t*) h_flagB_ = 0;
+    *(volatile uint32_t*) h_epA_ = 0;
+    *(volatile uint32_t*) h_epB_ = 0;
+    h_eplan_[2] = h_eplan_[plan_i32_ + 2] = 0;   // no block belongs to a layer step of this window yet
+    ep_want_ = 0;
     for (uint32_t* f : h_hand_flag_) *(volatile uint32_t*) f = 0;
     std::atomic_thread_fence(std::memory_order_seq_cst);
     last_t_ = T;
@@ -956,11 +988,24 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             std::atomic_thread_fence(std::memory_order_seq_cst);
             *(volatile uint32_t*) h_flagA_ = want;
             raise_flag(h_flagB_, want);
+            *(volatile uint32_t*) h_epA_ = want;
+        }
+        if (ep_want_ == want) {                              // the first GPU computes some of this layer's experts
+            const Clock::time_point c = Clock::now();
+            while (*(volatile uint32_t*) h_epB_ < want) {
+                _mm_pause();
+                if (Clock::now() - c > std::chrono::seconds(20)) {
+                    err = "verify: the first GPU never served layer " + std::to_string(l);
+                    return false;
+                }
+            }
+            ms_ep += ms_since(c);
         }
         *flag = want;
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
         ms_pool += ms_since(b);
     }
+    *(volatile uint32_t*) h_epA_ = (uint32_t) (g.n_layers * G);   // the first GPU's remaining layers: nothing to serve
     progress_at("verify window: waiting for the GPU to finish the window (flags A/B/M raised)", (int64_t) T);
     for (Part& P : stages_) {
         const cudaError_t se = cudaStreamSynchronize(P.cs);
@@ -1026,6 +1071,20 @@ void Verifier::set_plan_slot(int64_t layer, int grp) {
     sink_.staging = (unsigned long long) (cur_part_->staging_ +
                                           (size_t) (grp * per) * strata::kernels::cpu::expert_layout().max_blob);
     sink_.staging_cap = per;
+    if (ep_) {
+        int32_t* eb = h_eplan_ + (size_t) grp * (size_t) plan_i32_;
+        sink_.ep_counts = eb;
+        sink_.ep_start = eb + 4;
+        sink_.ep_dst = sink_.ep_start + cap + 1;
+        sink_.ep_tok = sink_.ep_dst + cap;
+        sink_.ep_ptr = (unsigned long long*) (eb + ptr_off);
+    }
+}
+
+void Verifier::set_ep(int32_t slot_end) {
+    ep_ = true;
+    sink_.ep_slot_end = slot_end;
+    sink_.ep_layer0 = stages_.size() > 1 ? stages_[1].l0 : g_->n_layers;
 }
 
 // Flag B only rises: a host function of an earlier layer may run after a later layer already raised it directly.
@@ -1063,8 +1122,17 @@ void Verifier::fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t byt
 
 void Verifier::publish_plan(void* ctx) {
     Verifier* v = (Verifier*) ctx;
+    const uint32_t want = v->cur_layer_ + 1;
+    if (v->sink_.ep_counts != nullptr) {   // every layer step, so the first GPU keeps pace with the pool
+        if (v->sink_.ep_counts[0] > 0) {
+            v->sink_.ep_counts[2] = (int32_t) want;
+            v->ep_want_ = want;
+        }
+        _mm_sfence();
+        *(volatile uint32_t*) v->h_epA_ = want;
+    }
     _mm_sfence();
-    *(volatile uint32_t*) v->h_flagA_ = v->cur_layer_ + 1;
+    *(volatile uint32_t*) v->h_flagA_ = want;
 }
 
 bool Verifier::commit(int n_keep, std::string& err) { return commit_launch(n_keep, err) && commit_wait(err); }

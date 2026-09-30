@@ -279,6 +279,9 @@ struct Options {
     /// The vision path: keep a per-cell (t, h, w) rotary position table so --serve can take GENI requests.
     bool vision = false;
     int adapt_swaps = 96;
+    /// Expert parallelism: this many of the first GPU's cache slots hold experts of the later GPUs' layers that do
+    /// not fit in their own caches; the verify window computes those on the first GPU (0 = off).
+    int ep_slots = 0;
     /// --serve: how many conversation checkpoints to keep between requests (0 = every request reads its whole
     /// prompt again, the v0.1.2 behaviour).  One is the GDN recurrence of the 36 layers, the QSA indexer tails and
     /// the PLE history (~118 MB of host RAM); the KV cache itself is positional and stays where it is.
@@ -843,8 +846,8 @@ double probe_pcie_h2d_gbps() {
     return bw;
 }
 
-/// The VRAM expert tier over the pipeline's GPUs (placement.hpp): one cache per GPU, holding only its stage's layers,
-/// with the slots numbered across them - stage s owns [first[s], first[s + 1]) - and the device address of every
+/// The VRAM expert tier over the pipeline's GPUs (placement.hpp): one cache per GPU, holding its stage's layers (the
+/// first GPU's also --ep-slots experts of later layers), with the slots numbered across them - stage s owns [first[s], first[s + 1]) - and the device address of every
 /// slot (what the verify window's plan and the prompt path read a resident expert from).
 struct VramTier {
     std::vector<std::unique_ptr<strata::core::ExpertCache>> caches;
@@ -867,9 +870,11 @@ struct VramTier {
         return s;
     }
     int32_t slot_of(int64_t layer, int64_t expert) const {
-        const int s = strata::core::placement().stage_of(layer);
-        const int32_t local = caches[(size_t) s]->slot_of(layer, expert);
-        return local == strata::core::kNotResident ? local : first[(size_t) s] + local;
+        for (size_t s = 0; s < caches.size(); ++s) {
+            const int32_t local = caches[s]->slot_of(layer, expert);
+            if (local != strata::core::kNotResident) return first[s] + local;
+        }
+        return strata::core::kNotResident;
     }
     uint8_t* device_slot(int32_t slot) { return (uint8_t*) addr[(size_t) slot]; }
     /// Stage s's slots from `slot` to its last one, in bytes: what the prompt path borrows from there.
@@ -1271,6 +1276,7 @@ int main(int argc, char** argv) {
             o.stop_eos = true;
         }
         else if (a == "--adapt-swaps") o.adapt_swaps = std::atoi(next("--adapt-swaps"));
+        else if (a == "--ep-slots") o.ep_slots = std::atoi(next("--ep-slots"));
         else if (a == "--expert-cache-cpu-order") o.expert_cache_cpu_order = true;
         else if (a == "--expert-cache-per-layer") o.expert_cache_per_layer = true;
         else if (a == "--no-hit-poke") o.no_hit_poke = true;
@@ -1978,6 +1984,36 @@ int main(int argc, char** argv) {
         }
         want_slots[(size_t) st] = (int64_t) sized_slots[(size_t) st].size();
     }
+    // expert parallelism: the first GPU's last --ep-slots slots take the best-ranked experts of the later GPUs' layers
+    // that their own caches do not hold, in place of its own lowest-ranked ones
+    if (o.ep_slots > 0) {
+        if (n_stages < 2 || !native_pack || profile.empty() || sized_slots[0].empty()) {
+            std::fprintf(stderr, "strata generate: --ep-slots needs two GPUs, a native pack and --expert-profile\n");
+            return 1;
+        }
+        std::vector<int64_t> held((size_t) n_stages, 0);
+        std::vector<std::pair<int32_t, int32_t>> foreign;
+        for (const auto& pr : profile) {
+            const int st = pl.stage_of(pr.first);
+            if (st > 0 && held[(size_t) st]++ >= want_slots[(size_t) st]) foreign.push_back(pr);
+        }
+        uint64_t cap = 0;
+        for (const int64_t b : sized_slots[0]) cap += (uint64_t) (b + 255) / 256 * 256;
+        auto& sp0 = stage_profile[0];
+        sp0.resize(sized_slots[0].size() - std::min(sized_slots[0].size(), (size_t) o.ep_slots));
+        sp0.insert(sp0.end(), foreign.begin(), foreign.begin() + (ptrdiff_t) std::min(foreign.size(), (size_t) o.ep_slots));
+        sized_slots[0].clear();
+        uint64_t used = 0;
+        size_t n = 0;
+        for (; n < sp0.size(); ++n) {
+            const uint64_t b = (lay.blob_bytes(sp0[n].first) + 255) / 256 * 256;
+            if (used + b > cap) break;
+            used += b;
+            sized_slots[0].push_back((int64_t) lay.blob_bytes(sp0[n].first));
+        }
+        sp0.resize(n);
+        want_slots[0] = (int64_t) n;
+    }
     for (int st = 0; st < n_stages; ++st) {
         // With `--expert-cache auto` the reserve must still be free once the slots are WRITTEN: under WDDM an
         // allocation is not resident until it is touched, and the free figure read before it can be ~1 GB too
@@ -2131,6 +2167,11 @@ int main(int argc, char** argv) {
         }
         prefilled += filled;
     }
+    if (o.ep_slots > 0)
+        std::fprintf(stderr, "strata generate: expert parallelism: %lld of GPU %d's slots hold later layers' experts\n",
+                     (long long) std::count_if(stage_profile[0].begin(), stage_profile[0].begin() + tier.caches[0]->resident(),
+                                               [&](const auto& pr) { return pl.stage_of(pr.first) != 0; }),
+                     pl.device(0));
     if (!profile.empty() && srcp != nullptr) {
         mem_mark("the profile fill");
         std::fprintf(stderr, "strata generate: pre-filled %lld of %lld slots from the profile; slot 0 verified\n",
@@ -2901,7 +2942,7 @@ int main(int argc, char** argv) {
         } else {
             std::fprintf(stderr, "strata serve: the prompt path allocates its own buffers (too few cache slots to borrow)\n");
         }
-        if (!sp.init(wt, g, ss, srcp, tier.addr.data(), host_res.data(), o.prefill_chunk, err, borrow)) {
+        if (!sp.init(wt, g, ss, srcp, tier.addr.data(), host_res.data(), tier.first.data(), o.prefill_chunk, err, borrow)) {
             std::fprintf(stderr, "strata serve: %s\n", err.c_str());
             return 1;
         }
@@ -2935,6 +2976,7 @@ int main(int argc, char** argv) {
         // issue #31's thread dumps show the host stuck in that cudaMemcpyAsync on a driver lock for good.  The copy
         // kernel needs no host CUDA call there, and costs ~1-3% decode on IQ3_S (45.3 -> 44.8 tok/s, 8 requests).
         ver.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
+        if (o.ep_slots > 0) ver.set_ep(tier.first[1]);
         std::vector<int64_t> cur;
         // ---- the conversation cache (see ConvCheckpoint).  `live` is what the session holds right now: the tokens
         // it has consumed, so a request that starts with exactly them continues without any copy.  `checks` are the
@@ -3932,7 +3974,7 @@ int main(int argc, char** argv) {
         if (borrow.empty())
             std::fprintf(stderr, "strata generate: prompt path allocates its own buffers (no cache slots to borrow)\n");
         if (!prefill.init(wt, g, ss, srcp, o.expert_cache > 0 ? tier.addr.data() : nullptr,
-                          host_res.empty() ? nullptr : host_res.data(), o.prefill_chunk, err, borrow)) {
+                          host_res.empty() ? nullptr : host_res.data(), tier.first.data(), o.prefill_chunk, err, borrow)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
@@ -4232,9 +4274,10 @@ int main(int argc, char** argv) {
         // issue #31's thread dumps show the host stuck in that cudaMemcpyAsync on a driver lock for good.  The copy
         // kernel needs no host CUDA call there, and costs ~1-3% decode on IQ3_S (45.3 -> 44.8 tok/s, 8 requests).
         ver.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
+        if (o.ep_slots > 0) ver.set_ep(tier.first[1]);
         drive.d.plan = ver.plan_sink();
         drive.d.pcie_num = pcie_shares(o.pcie_frac, g.n_layers, g_link_bw);
-        const int64_t pcie0 = drive.d.pcie_experts;
+        const int64_t pcie0 = drive.d.pcie_experts, ep0 = drive.d.ep_experts;
         if (o.adapt_every > 0 && o.adapt_swaps > 0) drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
         int64_t swaps_total = 0;
         double ms_adapt = 0;
@@ -4501,6 +4544,10 @@ int main(int argc, char** argv) {
             std::printf("%-24s %.2f distinct experts per layer read over PCIe (share %d/256 to %d/256 of the misses)\n",
                         "pcie experts", (double) (drive.d.pcie_experts - pcie0) / (double) (rounds * g.n_layers),
                         drive.d.pcie_num.front(), drive.d.pcie_num.back());
+        if (rounds > 0 && o.ep_slots > 0)
+            std::printf("%-24s %.2f distinct experts per round computed by the first GPU for later layers; the pool "
+                        "waited %.3f ms/round for them\n", "expert parallel", (double) (drive.d.ep_experts - ep0) / (double) rounds,
+                        ver.ms_ep / rounds);
         (void) pool_ms0;
         if (use_mtp && rounds > 0)
             std::printf("%-24s %.3f ms/round drafting (%lld rounds), MTP prompt %.1f ms, %.0f MiB of VRAM\n", "mtp",

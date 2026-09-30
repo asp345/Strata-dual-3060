@@ -113,8 +113,13 @@ public:
     /// arena directly, 2 = a copy kernel stages it inside the graph (no API calls on the pool's thread; best when
     /// the CPU is RAM-bound, Q2_0).  Set before the first `run`.
     void set_pcie_mode(int mode) { sink_.pcie_mode = mode; }
+    /// Expert parallelism: the VRAM tier's slots below `slot_end` are the first GPU's, and a later GPU's layer may
+    /// have experts there.  After its own layers the first GPU's graph serves them layer by layer: it waits for the
+    /// pool's plan of those entries, computes them and writes their rows beside the CPU's.  Set before the first `run`.
+    void set_ep(int32_t slot_end);
 
     double ms_wait = 0, ms_pool = 0, ms_host = 0, ms_commit = 0;
+    double ms_ep = 0;   ///< the pool's wait for the first GPU's rows (set_ep), after its own share
     int64_t windows = 0;
 
 private:
@@ -208,6 +213,11 @@ private:
     int32_t* h_plan_ = nullptr;  int32_t* m_plan_ = nullptr;     // counts | start | dst | tok | ptr (as int32 pairs)
     int64_t plan_i32_ = 0;                                        // int32 words in the plan block
     GpuPlanSink sink_;
+    bool ep_ = false;                                             // set_ep
+    int32_t* h_eplan_ = nullptr; int32_t* m_eplan_ = nullptr;    // the first GPU's plan blocks (the plan's layout)
+    uint32_t* h_epA_ = nullptr;  uint32_t* m_epA_ = nullptr;     // its plan is in place
+    uint32_t* h_epB_ = nullptr;  uint32_t* m_epB_ = nullptr;     // its rows are in place
+    uint32_t ep_want_ = 0;                                        // the layer step whose rows the first GPU computes
     uint32_t cur_layer_ = 0;
     static void publish_plan(void* ctx);
     void set_plan_slot(int64_t layer, int grp);

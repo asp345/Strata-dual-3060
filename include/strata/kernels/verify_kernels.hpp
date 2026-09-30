@@ -38,6 +38,16 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
 /// Spin until *flag >= value (a mapped host flag).  The value is fixed at capture, so several rings can be
 /// outstanding at once (the split verify window keeps two).
 void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream);
+/// *flag = value (a mapped host flag), ordered after every earlier write of the stream.
+void set_flag(uint32_t* flag, uint32_t value, void* stream);
+/// dst[:n] = src[:n] (mapped), with dst[0] = dst[1] = 0 unless src[2] == tag: a plan block whose counts are [0], [1]
+/// and whose owner is [2].
+void take_plan(int32_t* dst, const int32_t* src, int64_t n, int32_t tag, void* stream);
+/// dst[:n] = src[:n] (mapped host memory) when *gate (device memory) is not 0.
+void copy_from_mapped_if(float* dst, const float* src, int64_t n, const int32_t* gate, void* stream);
+/// Rows rows[e] of src to the same rows of dst (mapped host memory), e < *n; launched for `cap` rows.
+void rows_to_mapped(float* dst, const float* src, const int32_t* rows, const int32_t* n, int64_t cap, int64_t row_floats,
+                    void* stream);
 
 /// Rows of the S2/S4/S8 embedding for T token ids read from DEVICE memory; out (T, n).  Bitwise `embedding_gather`.
 void embedding_gather_dev(const uint8_t* codes, const float* scales, const float* offsets, const int32_t* tokens,

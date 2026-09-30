@@ -5,6 +5,7 @@
 #include "strata/kernels/verify_kernels.hpp"
 
 #include <cuda_runtime.h>
+#include <algorithm>
 
 #include <cstdio>
 #include <cstdlib>
@@ -431,6 +432,69 @@ __global__ void wait_flag_ge_kernel(const volatile uint32_t* flag, uint32_t valu
 void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream) {
     wait_flag_ge_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value);
     check("wait_flag_ge");
+}
+
+namespace {
+__global__ void set_flag_kernel(uint32_t* flag, uint32_t value) {
+    __threadfence_system();
+    *(volatile uint32_t*) flag = value;
+}
+
+__global__ void take_plan_kernel(int32_t* __restrict__ dst, const volatile int32_t* src, int n, int32_t tag) {
+    __shared__ bool ok;
+    if (threadIdx.x == 0) ok = src[2] == tag;
+    __syncthreads();
+    for (int i = threadIdx.x; i < n; i += blockDim.x) dst[i] = (i < 2 && !ok) ? 0 : src[i];
+}
+
+__global__ void copy_from_mapped_if_kernel(float4* __restrict__ dst, const volatile float4* src, int64_t n4,
+                                           const int32_t* __restrict__ gate) {
+    if (*gate == 0) return;
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += (int64_t) gridDim.x * blockDim.x)
+        dst[i] = const_cast<const float4*>(src)[i];
+}
+
+__global__ void rows_to_mapped_kernel(float4* dst, const float4* __restrict__ src, const int32_t* __restrict__ rows,
+                                      const int32_t* __restrict__ n, int row4) {
+    if ((int) blockIdx.x >= *n) return;
+    const size_t r = (size_t) rows[blockIdx.x] * (size_t) row4;
+    for (int i = threadIdx.x; i < row4; i += blockDim.x) dst[r + i] = src[r + i];
+    __threadfence_system();
+}
+}  // namespace
+
+void set_flag(uint32_t* flag, uint32_t value, void* stream) {
+    set_flag_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value);
+    check("set_flag");
+}
+
+void take_plan(int32_t* dst, const int32_t* src, int64_t n, int32_t tag, void* stream) {
+    take_plan_kernel<<<1, 256, 0, (cudaStream_t) stream>>>(dst, (const volatile int32_t*) src, (int) n, tag);
+    check("take_plan");
+}
+
+void copy_from_mapped_if(float* dst, const float* src, int64_t n, const int32_t* gate, void* stream) {
+    if (n <= 0) return;
+    if ((n & 3) != 0 || ((uintptr_t) dst & 15) != 0 || ((uintptr_t) src & 15) != 0) {
+        std::fprintf(stderr, "copy_from_mapped_if: n must be a multiple of 4 and both pointers 16-byte aligned\n");
+        std::exit(1);
+    }
+    const int64_t n4 = n / 4;
+    copy_from_mapped_if_kernel<<<(unsigned) std::min<int64_t>((n4 + 255) / 256, 64), 256, 0, (cudaStream_t) stream>>>(
+        (float4*) dst, (const volatile float4*) src, n4, gate);
+    check("copy_from_mapped_if");
+}
+
+void rows_to_mapped(float* dst, const float* src, const int32_t* rows, const int32_t* n, int64_t cap, int64_t row_floats,
+                    void* stream) {
+    if (cap <= 0) return;
+    if ((row_floats & 3) != 0 || ((uintptr_t) dst & 15) != 0 || ((uintptr_t) src & 15) != 0) {
+        std::fprintf(stderr, "rows_to_mapped: rows must be multiples of 4 floats and both pointers 16-byte aligned\n");
+        std::exit(1);
+    }
+    rows_to_mapped_kernel<<<(unsigned) cap, 256, 0, (cudaStream_t) stream>>>((float4*) dst, (const float4*) src, rows, n,
+                                                                             (int) (row_floats / 4));
+    check("rows_to_mapped");
 }
 
 void embedding_gather_dev(const uint8_t* codes, const float* scales, const float* offsets, const int32_t* tokens,
