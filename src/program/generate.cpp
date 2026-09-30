@@ -2077,6 +2077,10 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: expert cache auto: GPU %d: %.2f GiB free, %d MiB reserved -> %lld slots\n",
                          pl.device(st), (double) free_b / 1073741824.0, o.vram_reserve_mib,
                          (long long) std::max<int64_t>(slots, 0));
+            if (slots <= 0)   // the verify window cannot start without it (#174): say what makes room
+                std::fprintf(stderr, "strata generate: no VRAM is left for the expert cache on GPU %d: lower "
+                                     "--max-context, use --kv k8v4, or close other programs that use the GPU\n",
+                             pl.device(st));
         } else {
             // an explicit number of slots is shared by the GPUs in proportion to their layers
             slots = (int64_t) o.expert_cache * (pl.end(st) - pl.first(st)) / g.n_layers;
@@ -3712,6 +3716,7 @@ int main(int argc, char** argv) {
             };
             // tokens [a, b) through the windows: commit all of them, then give the draft layer their residuals
             auto read_windows = [&](int64_t a, int64_t b, std::string& e) -> bool {
+                strata::core::progress_at("reading the prompt (verify windows), from token", a);   // #217: not "batched"
                 // every token is committed and the picks are discarded: no head sampling (see set_head_sampling)
                 struct NoHeadSampling {
                     strata::core::Verifier& v;
