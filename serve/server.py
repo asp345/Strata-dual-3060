@@ -522,6 +522,7 @@ class Service:
         self.fit_max_tokens = fit_max_tokens          # --fit-max-tokens: clamp the output cap instead of 400
         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
         self.shared = {}                              # the web app's Chat settings for every client (POST /settings)
+        self.created = time.time()                    # GET /v1/models' `created`
         self.shared_path = None                       # where they are kept between starts (next to the config)
         self.fifo = threading.Lock()
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
@@ -572,11 +573,31 @@ class Service:
                     req["output_config"] = {"effort": effort}
         return req
 
+    SUPPORTED_PARAMETERS = ["frequency_penalty", "max_tokens", "min_p", "presence_penalty", "reasoning",
+                            "reasoning_effort", "repetition_penalty", "seed", "temperature", "tools", "top_k", "top_p"]
+
     def model_card(self) -> dict:
-        """GET /v1/models' entry, with OpenRouter's `reasoning` object: the efforts a request may ask for, and what a
-        request that names none gets (the shared Chat setting, else thinking at the highest level)."""
+        """GET /v1/models' entry in OpenRouter's model shape: the context, the longest completion (whatever the context
+        leaves after the prompt), the input modalities, the request parameters this server applies, the sampling a
+        request that sets none gets (the config's, then the shared Chat settings; greedy otherwise), and the
+        `reasoning` object: the efforts a request may ask for, and the default (the shared Chat setting, else thinking
+        at the highest level)."""
         shared = self.shared.get("reasoning_effort")
-        return {"id": self.model, "object": "model",
+        ctx = int(self.engine.max_context)
+        inputs = ["text", "image"] if self.vision is not None else ["text"]
+        defaults = {**self.sampling_defaults, **self.shared}
+        sampling = {k: defaults[k] for k in ("temperature", "top_p", "top_k", "min_p", "repetition_penalty",
+                                             "frequency_penalty", "presence_penalty") if defaults.get(k) is not None}
+        sampling.setdefault("temperature", 0.0)
+        return {"id": self.model, "object": "model", "name": self.model, "created": int(self.created),
+                "context_length": ctx,
+                "architecture": {"modality": "+".join(inputs) + "->text", "input_modalities": inputs,
+                                 "output_modalities": ["text"], "tokenizer": "Qwen", "instruct_type": None},
+                "pricing": {"prompt": "0", "completion": "0"},
+                "top_provider": {"context_length": ctx, "max_completion_tokens": ctx - CTX_SLACK, "is_moderated": False},
+                "per_request_limits": None,
+                "supported_parameters": list(self.SUPPORTED_PARAMETERS),
+                "default_parameters": sampling,
                 "reasoning": {"mandatory": False, "default_enabled": shared != "none",
                               "supported_efforts": list(REASONING_EFFORTS),
                               "default_effort": shared if shared and shared != "none" else "high"}}
