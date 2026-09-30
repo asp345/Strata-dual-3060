@@ -35,6 +35,7 @@
 #include "strata/kernels/native_qsa.hpp"
 #include "strata/kernels/native_qsa_indexer.hpp"
 #include "strata/kernels/native_rope.hpp"
+#include "strata/kernels/rope_yarn.hpp"
 #include "strata/kernels/mrope.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/qsa.hpp"
@@ -112,6 +113,9 @@ struct Options {
     std::vector<int64_t> tokens;      // the prompt, PRE-TOKENIZED
     int64_t max_new = 16;
     int64_t max_context = 4096;
+    std::string rope_scaling;        ///< "yarn" or empty (strata/kernels/rope_yarn.hpp)
+    double rope_scale = 0.0;
+    int64_t yarn_orig_ctx = 262144;   ///< the model's context_length
     bool greedy = true;
     uint64_t seed = 0;
     int top_k = 20;
@@ -369,6 +373,8 @@ void usage() {
                  "  --expert-cache-cpu-order  experimental GPU expert reduction matching CPU order\n"
                  "  --max-new N          tokens to generate (default 16)\n"
                  "  --max-context N      KV/state capacity (default 4096)\n"
+                 "  --rope-scaling yarn  YaRN, the positions scaled by --rope-scale F (> 1) over --yarn-orig-ctx N\n"
+                 "                       (default 262144) trained positions, at every position of every request\n"
                  "  --greedy             argmax (the default)\n"
                  "  --seed S             enable sampling with this Philox seed\n"
                  "  --top-k N --top-p F --temperature F\n"
@@ -1235,6 +1241,9 @@ int main(int argc, char** argv) {
         }
         else if (a == "--max-new") o.max_new = std::atoll(next("--max-new"));
         else if (a == "--max-context") o.max_context = std::atoll(next("--max-context"));
+        else if (a == "--rope-scaling") o.rope_scaling = next("--rope-scaling");
+        else if (a == "--rope-scale") o.rope_scale = std::atof(next("--rope-scale"));
+        else if (a == "--yarn-orig-ctx") o.yarn_orig_ctx = std::atoll(next("--yarn-orig-ctx"));
         else if (a == "--greedy") o.greedy = true;
         else if (a == "--seed") { o.seed = (uint64_t) std::atoll(next("--seed")); o.greedy = false; }
         else if (a == "--top-k") o.top_k = std::atoi(next("--top-k"));
@@ -1477,6 +1486,10 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: --max-context must be below 2^31\n");
         return 2;
     }
+    if (!o.rope_scaling.empty() && (o.rope_scaling != "yarn" || o.rope_scale <= 1.0 || o.yarn_orig_ctx <= 0)) {
+        std::fprintf(stderr, "strata generate: --rope-scaling yarn needs --rope-scale above 1 and a positive --yarn-orig-ctx\n");
+        return 2;
+    }
     if (o.max_new <= 0 || o.max_context <= 0 || o.max_new > o.max_context ||
         o.tokens.size() > (size_t) (o.max_context - o.max_new)) {
         std::fprintf(stderr, "strata generate: positive --max-new and --max-context must fit the prompt and generation\n");
@@ -1705,6 +1718,9 @@ int main(int argc, char** argv) {
     strata::kernels::native_qsa_set_enabled(o.native_qsa);
     strata::kernels::native_qsa_indexer_set_enabled(o.native_qsa_indexer);
     strata::kernels::native_rope_set_enabled(o.native_rope);
+    if (o.rope_scaling == "yarn")
+        strata::kernels::rope_yarn_set(o.rope_scale, o.yarn_orig_ctx, strata::kernels::qsa_freq_base(),
+                                       (int) strata::kernels::qsa_real_shapes().n_rot);
     // The vision path: every rope kernel reads a cell's (t, h, w) from this table (strata/kernels/mrope.hpp).  It is
     // the identity until an image request, and it is set here, before any CUDA graph captures a rope kernel.
     std::vector<int32_t*> d_mrope;   // one per GPU

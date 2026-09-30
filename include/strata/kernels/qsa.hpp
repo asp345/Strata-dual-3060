@@ -118,7 +118,7 @@ inline QsaShapes qsa_real_shapes() {
 
 /// The one legal RMSNorm epsilon for this artifact (`attention.layer_norm_rms_epsilon`).
 inline float qsa_rms_eps() { return 1e-6f; }
-/// `rope.freq_base`, no rope.scaling keys, so freq_scale = 1 and no YaRN.
+/// `rope.freq_base`; the artifact has no rope.scaling keys (YaRN is a runtime option, rope_yarn.hpp).
 inline double qsa_freq_base() { return 1e7; }
 
 /// The selection width: `min(n_kv, idx_top_k + idx_block - 1)`.

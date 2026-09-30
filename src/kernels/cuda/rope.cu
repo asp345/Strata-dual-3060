@@ -22,9 +22,11 @@
 // loose tolerance.  The engine wants a cached table anyway: it is per (n_rot, theta, position), not per token.
 #include "strata/kernels/rope.hpp"
 #include "strata/kernels/mrope.hpp"
+#include "strata/kernels/rope_yarn.hpp"
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -33,13 +35,21 @@ namespace strata::kernels {
 
 void build_rope_table(int n_rot, double theta, int max_pos, float* cos_tab, float* sin_tab) {
     const int half = n_rot / 2;
+    const RopeYarn& y = rope_yarn();
     for (int p = 0; p < max_pos; ++p) {
         for (int i = 0; i < half; ++i) {
             // float64 throughout, in the reference's order: inv, then ang, then cos/sin
             const double inv = std::pow(theta, -2.0 * (double) i / (double) n_rot);
-            const double ang = (double) p * inv;
-            cos_tab[(size_t) p * half + i] = (float) std::cos(ang);
-            sin_tab[(size_t) p * half + i] = (float) std::sin(ang);
+            const double ext = (double) p * inv;
+            double ang = (double) y.freq_scale * ext, mscale = y.attn_factor;
+            if (y.ext_factor != 0.0f) {
+                const double r = ((double) i - y.corr0) / std::max(0.001, (double) (y.corr1 - y.corr0));
+                const double mix = (1.0 - std::min(1.0, std::max(0.0, r))) * y.ext_factor;
+                ang = ang * (1.0 - mix) + ext * mix;
+                mscale *= 1.0 + 0.1 * std::log(1.0 / y.freq_scale);
+            }
+            cos_tab[(size_t) p * half + i] = (float) (std::cos(ang) * mscale);
+            sin_tab[(size_t) p * half + i] = (float) (std::sin(ang) * mscale);
         }
     }
 }

@@ -24,7 +24,9 @@
 // SOFTWARE.
 #include "strata/kernels/native_rope.hpp"
 #include "strata/kernels/mrope.hpp"
+#include "strata/kernels/rope_yarn.hpp"
 #include <cuda_runtime.h>
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
@@ -39,7 +41,7 @@ bool overlaps(const void* a, size_t an, const void* b, size_t bn) {
     return x <= y ? y - x < an : x - y < bn;
 }
 __global__ void apply(const float* x, float* out, int rows, int width,
-                      int n_rot, float theta_scale, const int* positions, const int32_t* mtab) {
+                      int n_rot, float theta_scale, const int* positions, const int32_t* mtab, RopeYarn yarn) {
     const int row = blockIdx.y;
     const int pair = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= rows || pair >= width / 2) return;
@@ -51,8 +53,8 @@ __global__ void apply(const float* x, float* out, int rows, int width,
         }
         return;
     }
-    const float theta = mrope_pos(mtab, positions[row], pair) * powf(theta_scale, float(pair));
-    const float c = cosf(theta), s = sinf(theta);
+    float c, s;
+    rope_yarn_cs(mrope_pos(mtab, positions[row], pair) * powf(theta_scale, float(pair)), pair, yarn, c, s);
     const float a = x[start + pair], b = x[start + pair + n_rot / 2];
     out[start + pair] = a * c - b * s;
     out[start + pair + n_rot / 2] = a * s + b * c;
@@ -71,6 +73,19 @@ void mrope_table_set(const int32_t* device_table) {
     mrope_tab[current_device()].store(device_table, std::memory_order_relaxed);
 }
 const int32_t* mrope_table() { return mrope_tab[current_device()].load(std::memory_order_relaxed); }
+namespace {
+RopeYarn yarn_setting;
+}
+void rope_yarn_set(double factor, int64_t orig_ctx, double freq_base, int n_rot) {
+    // ggml_rope_yarn_corr_dims: the pair that turns `beta` times over the trained context
+    auto corr = [&](double beta) { return n_rot * std::log((double) orig_ctx / (beta * 2.0 * M_PI)) / (2.0 * std::log(freq_base)); };
+    yarn_setting.freq_scale = (float) (1.0 / factor);
+    yarn_setting.ext_factor = 1.0f;
+    yarn_setting.attn_factor = 1.0f;
+    yarn_setting.corr0 = (float) std::max(0.0, std::floor(corr(32.0)));
+    yarn_setting.corr1 = (float) std::min((double) (n_rot - 1), std::ceil(corr(1.0)));
+}
+const RopeYarn& rope_yarn() { return yarn_setting; }
 void native_rope_set_enabled(bool value) { enabled.store(value, std::memory_order_relaxed); }
 bool native_rope_enabled() { return enabled.load(std::memory_order_relaxed); }
 void native_rope_apply(const float* x, float* out, int rows, int head_dim,
@@ -91,7 +106,8 @@ void native_rope_apply(const float* x, float* out, int rows, int head_dim,
     // Match pinned host-side float powf before device fast powf/trigonometry.
     const float theta_scale = powf(freq_base, -2.0f / n_rot);
     apply<<<dim3((head_dim / 2 + 127) / 128, rows), 128, 0,
-              static_cast<cudaStream_t>(stream)>>>(x, out, rows, head_dim, n_rot, theta_scale, positions, mrope_table());
+              static_cast<cudaStream_t>(stream)>>>(x, out, rows, head_dim, n_rot, theta_scale, positions, mrope_table(),
+                                                   rope_yarn());
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
