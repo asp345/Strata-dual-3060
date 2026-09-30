@@ -98,6 +98,35 @@ __global__ void gr_write_kernel(float* __restrict__ R, const float* __restrict__
     const int64_t t = i / D, c = (i % D) / N, d = i % N;
     R[i] = fmaf(bo[t * N + d], 2.0f * sigm(inj[t * inj_ld + c] / (float) HC), R[i]);
 }
+// gr_write_kernel for one row (t, c), then gr_norm_kernel over it with the next half's norm weights: the same
+// thread-to-element mapping and block_sum, so row_rs and the BF16 image are gr_norm's bits, and R is not read back
+constexpr int GRW_PER = (N + 255) / 256;
+__global__ void __launch_bounds__(256) gr_write_norm_kernel(float* __restrict__ R, const float* __restrict__ bo,
+                                                            const float* __restrict__ inj, int64_t inj_ld,
+                                                            const float* __restrict__ w, float eps,
+                                                            float* __restrict__ row_rs, uint16_t* __restrict__ xn16) {
+    __shared__ float sh[32];
+    const int64_t row = blockIdx.x;                 // t * 4 + c
+    const int64_t t = row / HC;
+    const int c = (int) (row % HC);
+    float* r = R + row * N;
+    const float sc = 2.0f * sigm(inj[t * inj_ld + c] / (float) HC);
+    float v[GRW_PER];
+    float ss = 0.0f;
+    int k = 0;
+#pragma unroll
+    for (int d = threadIdx.x; d < N; d += 256, ++k) {
+        const float x = fmaf(bo[t * N + d], sc, r[d]);
+        r[d] = x;
+        v[k] = x;
+        ss += x * x;
+    }
+    const float rs = rsqrtf(block_sum(ss, sh) / (float) N + eps);
+    if (threadIdx.x == 0) row_rs[row] = rs;
+    k = 0;
+#pragma unroll
+    for (int d = threadIdx.x; d < N; d += 256, ++k) xn16[row * N + d] = bf(v[k] * rs * w[c * N + d]);
+}
 __global__ void gr_broadcast_kernel(const float* __restrict__ e, float* __restrict__ R, int64_t T) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= T * D) return;
@@ -501,6 +530,12 @@ void gr_mix(const float* R, const float* w_norm, const float* row_rs, const floa
     gr_mix_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(R, w_norm, row_rs, gated, mixed, mixed16, T,
                                                                          mixed_h);
     check("gr_mix");
+}
+void gr_write_norm(float* R, const float* bo, const float* inj, int64_t inj_ld, const float* w_norm_next, float eps,
+                   float* row_rs, uint16_t* xn16, int64_t T, void* stream) {
+    gr_write_norm_kernel<<<(unsigned) (T * HC), 256, 0, (cudaStream_t) stream>>>(R, bo, inj, inj_ld, w_norm_next, eps,
+                                                                                   row_rs, xn16);
+    check("gr_write_norm");
 }
 void gr_write(float* R, const float* bo, const float* inj, int64_t inj_ld, int64_t T, void* stream) {
     gr_write_kernel<<<blocks_for(T * D), 256, 0, (cudaStream_t) stream>>>(R, bo, inj, inj_ld, T);

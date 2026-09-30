@@ -23,6 +23,10 @@ void gr_mix(const float* R, const float* w_norm, const float* row_rs, const floa
             int64_t T, void* stream, uint16_t* mixed_h = nullptr);
 /// R[t, c, d] += bo[t, d] * 2 sigmoid(inj[t, c] / hc)   (inj has row stride inj_ld)
 void gr_write(float* R, const float* bo, const float* inj, int64_t inj_ld, int64_t T, void* stream);
+/// gr_write, then gr_norm of the next half (its norm weights) over the rows just written: the same bits as the two
+/// calls, without reading R back.
+void gr_write_norm(float* R, const float* bo, const float* inj, int64_t inj_ld, const float* w_norm_next, float eps,
+                   float* row_rs, uint16_t* xn16, int64_t T, void* stream);
 /// R[t, c, :] = e[t, :] for all four streams (the embedding broadcast).
 void gr_broadcast(const float* e, float* R, int64_t T, void* stream);
 
