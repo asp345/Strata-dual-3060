@@ -305,6 +305,9 @@ struct Options {
     /// result) goes through the verify windows, S tokens at a time, instead of the batched prompt path (0 = always
     /// the batched path)
     int64_t short_read = 64;
+    /// --serve diagnostic: the last N prompt tokens before the final one go through the verify windows, and the head's
+    /// negative log-probability of each true next token is reported (a SCORE line before REUSED)
+    int64_t score_tail = 0;
     /// The suffix drafter (prompt lookup): when the text being written repeats an earlier stretch of the context (code
     /// edits, quoted input, tool-call JSON) by at least this many tokens, the window may be filled with what followed
     /// it there instead of the MTP's drafts, where the MTP's own first guess agrees and the draft policy expects it to
@@ -394,6 +397,8 @@ void usage() {
                  "  --turn-token ID      --serve: the token that opens a chat turn (default 248045, <|im_start|>)\n"
                  "  --short-read N       --serve: read at most N fresh text tokens through the decode windows instead\n"
                  "                       of the batched prompt path (default 64, 0 = off)\n"
+                 "  --score-tail N       --serve: read the last N prompt tokens through the decode windows and print\n"
+                 "                       SCORE <tokens> <top-1 hits> <NLL of each true next token, comma-separated>\n"
                  "  --suffix-draft N     prompt lookup: draft from an earlier repeat of the last N+ tokens of context\n"
                  "                       when it pays (default 3; 0 = MTP only)\n"
                  "  --mtp-max-t M        cap the MTP's windows at M tokens (0 = --spec; longer ones come from suffixes)\n"
@@ -1331,6 +1336,7 @@ int main(int argc, char** argv) {
         else if (a == "--prompt-cache-root") o.prompt_cache_root = std::max(0LL, std::atoll(next("--prompt-cache-root")));
         else if (a == "--turn-token") o.turn_token = std::atoll(next("--turn-token"));
         else if (a == "--short-read") o.short_read = std::max(0LL, std::atoll(next("--short-read")));
+        else if (a == "--score-tail") o.score_tail = std::max(0LL, std::atoll(next("--score-tail")));
         else if (a == "--suffix-draft") o.suffix_draft = std::max(0, std::atoi(next("--suffix-draft")));
         else if (a == "--mtp-max-t") o.mtp_max_t = std::max(0, std::atoi(next("--mtp-max-t")));
         else if (a == "--control-vector") o.cvec_files.push_back({next("--control-vector"), 1.0f});
@@ -3707,6 +3713,11 @@ int main(int argc, char** argv) {
             // read batched and its header still goes through the windows.  Picture rows need the batched path.
             // STRATA_CKPT_REREAD compares a restored checkpoint with a batched re-read, so it keeps every read batched.
             static const bool no_short = std::getenv("STRATA_CKPT_REREAD") != nullptr;
+            // --score-tail: the windows that read [score_from, n - 1) score each row against the true next token
+            const int64_t score_from = o.score_tail > 0 ? std::max<int64_t>(read_from, n - 1 - o.score_tail) : -1;
+            bool scoring = false;
+            int64_t score_top1 = 0;
+            std::vector<float> score_nll, score_logits;
             auto windows_ok = [&](int64_t a, int64_t b) -> bool {
                 if (no_short || b - a > o.short_read) return false;
                 if (sp.embd_rows != nullptr)
@@ -3737,6 +3748,18 @@ int main(int argc, char** argv) {
                     if (!ver.run(T, win.data(), q, &drive_pool_multi, &drive, outw.data(), e) || drive.d.failed) {
                         if (drive.d.failed && drive.d.fail) e = drive.d.fail;
                         return false;
+                    }
+                    if (scoring) {
+                        score_logits.resize((size_t) T * (size_t) n_vocab);
+                        if (!ver.head_logits(T, score_logits.data(), e)) return false;
+                        for (int t = 0; t < T; ++t) {
+                            const float* r = score_logits.data() + (size_t) t * (size_t) n_vocab;
+                            const int64_t best = std::max_element(r, r + n_vocab) - r;
+                            double sum = 0.0;
+                            for (int64_t v = 0; v < n_vocab; ++v) sum += std::exp((double) (r[v] - r[best]));
+                            score_nll.push_back((float) (std::log(sum) - (double) (r[nxt[(size_t) t]] - r[best])));
+                            score_top1 += best == nxt[(size_t) t];
+                        }
                     }
                     if (!ver.commit(T, e) || !mtp.prefill(ver.final_R_all(), nxt.data(), T, q, e)) return false;
                     q += T;
@@ -3834,10 +3857,11 @@ int main(int argc, char** argv) {
                         break;
                     }
             int64_t at = read_from;
-            for (const int64_t to : {reread_to, root_at, turn_at, n - 1}) {
+            for (const int64_t to : {reread_to, root_at, turn_at, score_from, n - 1}) {
                 if (to <= at) continue;
                 err.clear();
-                const bool win = windows_ok(at, to);
+                scoring = score_from >= 0 && at >= score_from;
+                const bool win = scoring || windows_ok(at, to);
                 if (win && !refill(err)) {
                     std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
                     return 1;
@@ -3881,6 +3905,11 @@ int main(int argc, char** argv) {
                 return 1;
             }
             tr("prompt done (slots refilled)");
+            if (score_from >= 0 && !cancelled) {
+                std::printf("SCORE %lld %lld ", (long long) score_nll.size(), (long long) score_top1);
+                for (size_t i = 0; i < score_nll.size(); ++i) std::printf(i ? ",%.4f" : "%.4f", score_nll[i]);
+                std::printf("\n");
+            }
             const double prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - r0).count();
             std::printf("REUSED %lld\n", (long long) resume);   // the prompt is read; the first window comes next
             std::fflush(stdout);
