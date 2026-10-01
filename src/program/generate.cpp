@@ -3856,8 +3856,18 @@ int main(int argc, char** argv) {
                         if (i >= o.prompt_cache_root) root_at = i;
                         break;
                     }
+            // And at the start of the last message, when at least --prompt-cache-root tokens are read before it: a new
+            // chat that sends the same conversation (a long document) with another question resumes there instead of
+            // at the last --prompt-cache-every checkpoint.
+            int64_t msg_at = -1;
+            if (turn_at > 0 && o.prompt_cache_root > 0)
+                for (int64_t i = turn_at - 1; i > read_from; --i)
+                    if (ids[(size_t) i] == o.turn_token) {
+                        if (i - read_from >= o.prompt_cache_root) msg_at = i;
+                        break;
+                    }
             int64_t at = read_from;
-            for (const int64_t to : {reread_to, root_at, turn_at, score_from, n - 1}) {
+            for (const int64_t to : {reread_to, root_at, msg_at, turn_at, score_from, n - 1}) {
                 if (to <= at) continue;
                 err.clear();
                 scoring = score_from >= 0 && at >= score_from;
@@ -3895,7 +3905,7 @@ int main(int argc, char** argv) {
                     break;
                 }
                 at = to;
-                if ((to == turn_at || to == root_at) && !checkpoint_at(to)) {
+                if ((to == turn_at || to == root_at || to == msg_at) && !checkpoint_at(to)) {
                     std::printf("ERR saving a conversation checkpoint failed\n");
                     return 1;
                 }
