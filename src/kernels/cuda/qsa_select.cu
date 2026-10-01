@@ -310,13 +310,13 @@ __global__ void __launch_bounds__(TK_T) block_topk_reg_kernel(const float* __res
     }
 }
 
-// ---- a query with more blocks than the register kernel holds: the same threads, per-warp histograms and scans, each
-// key read again on every pass. The same selection rule: identical ids.
+// ---- a query with more blocks than the register kernel holds: the same threads and per-warp histograms, each key read
+// again on every pass, 32 neighbours per warp at a time. The same selection rule: identical ids.
 __global__ void __launch_bounds__(TK_T) block_topk_kernel(const float* __restrict__ scores,
                                                           const int32_t* __restrict__ steps, int64_t max_blocks,
                                                           int64_t cap, int32_t* __restrict__ ids) {
     __shared__ int hist[TK_T / 32][256];
-    __shared__ int s_warp[33];
+    __shared__ int s_gt[TK_T / 32], s_eq[TK_T / 32];
     __shared__ int s_digit, s_above;
     const int64_t qi = blockIdx.x;
     const int32_t* st = steps + qi * kStepCount;
@@ -329,8 +329,7 @@ __global__ void __launch_bounds__(TK_T) block_topk_kernel(const float* __restric
     }
     const float* sc = scores + qi * max_blocks;
     const int64_t nb = n_bid + 1;
-    const int64_t per = (nb + TK_T - 1) / TK_T;
-    const int64_t b0 = (int64_t) t * per, b1 = (b0 + per < nb) ? b0 + per : nb;
+    const int64_t per = (nb + TK_T - 1) / TK_T;       // rows of 32 blocks per warp
     auto weight = [&](int64_t b) -> int { return b < n_bid ? R : (int) (n_kv - n_bid * R); };
     uint32_t prefix = 0;
     int above = 0;
@@ -366,32 +365,63 @@ __global__ void __launch_bounds__(TK_T) block_topk_kernel(const float* __restric
         __syncthreads();
     }
     const uint32_t thr = prefix;
-    const int64_t eq_budget = width - above;
+    const int eq_budget = (int) (width - above);
+    // ---- the cells, ascending: warp w holds the blocks [w * 32 * per, (w + 1) * 32 * per), row by row (a row is 32
+    // neighbours, one per lane), so the order is (warp, row, lane)
+    const int64_t w0 = (int64_t) warp * 32 * per;
     int gt = 0, eq = 0;
-    for (int64_t b = b0; b < b1; ++b) {
+    for (int64_t b = w0 + lane; b < nb && b < w0 + 32 * per; b += 32) {
         const int w = weight(b);
         if (w == 0) continue;
         const uint32_t k = order_key(sc[b]);
         if (k > thr) gt += w;
         else if (k == thr) eq += w;
     }
-    int tot;
-    const int eq_before = block_excl_scan(eq, s_warp, tot);
-    int64_t my_eq = eq_budget - eq_before;
-    if (my_eq < 0) my_eq = 0;
-    if (my_eq > eq) my_eq = eq;
-    const int sel = gt + (int) my_eq;
-    int64_t wpos = block_excl_scan(sel, s_warp, tot);
-    int64_t eq_left = my_eq;
-    for (int64_t b = b0; b < b1; ++b) {
-        const int w = weight(b);
-        if (w == 0) continue;
-        const uint32_t k = order_key(sc[b]);
-        if (k > thr) {
-            for (int c = 0; c < w; ++c) out[wpos++] = (int32_t) (b * R + c);
-        } else if (k == thr) {
-            for (int c = 0; c < w && eq_left > 0; ++c, --eq_left) out[wpos++] = (int32_t) (b * R + c);
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        gt += __shfl_xor_sync(0xffffffffu, gt, o);
+        eq += __shfl_xor_sync(0xffffffffu, eq, o);
+    }
+    if (lane == 0) { s_gt[warp] = gt; s_eq[warp] = eq; }
+    __syncthreads();
+    if (t == 0) {                                     // per warp: the tied cells and the selected cells before it
+        int eb = 0, sb = 0;
+        for (int w2 = 0; w2 < TK_T / 32; ++w2) {
+            const int g2 = s_gt[w2], e2 = s_eq[w2];
+            const int take = eq_budget - eb < 0 ? 0 : (eq_budget - eb > e2 ? e2 : eq_budget - eb);
+            s_gt[w2] = sb;
+            s_eq[w2] = eb;
+            sb += g2 + take;
+            eb += e2;
         }
+    }
+    __syncthreads();
+    int run_sel = s_gt[warp], run_eq = s_eq[warp];
+    for (int64_t r0 = w0; r0 < nb && r0 < w0 + 32 * per; r0 += 32) {
+        const int64_t b = r0 + lane;
+        const int w = b < nb ? weight(b) : 0;
+        const uint32_t k = w ? order_key(sc[b]) : 0u;
+        const int my_gt = (w && k > thr) ? w : 0, my_eq = (w && k == thr) ? w : 0;
+        if (__ballot_sync(0xffffffffu, (my_gt | my_eq) != 0) == 0u) continue;
+        int pe = my_eq;                               // tied cells up to and with this lane
+#pragma unroll
+        for (int o = 1; o < 32; o <<= 1) {
+            const int y = __shfl_up_sync(0xffffffffu, pe, o);
+            if (lane >= o) pe += y;
+        }
+        const int left = eq_budget - (run_eq + pe - my_eq);
+        const int take = left < 0 ? 0 : (left > my_eq ? my_eq : left);   // ties to the lowest index
+        const int my_sel = my_gt + take;
+        int ps = my_sel;
+#pragma unroll
+        for (int o = 1; o < 32; o <<= 1) {
+            const int y = __shfl_up_sync(0xffffffffu, ps, o);
+            if (lane >= o) ps += y;
+        }
+        int32_t* dst = out + run_sel + ps - my_sel;
+        for (int c = 0; c < my_sel; ++c) dst[c] = (int32_t) (b * R + c);
+        run_eq += __shfl_sync(0xffffffffu, pe, 31);
+        run_sel += __shfl_sync(0xffffffffu, ps, 31);
     }
 }
 
