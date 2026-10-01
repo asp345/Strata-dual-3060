@@ -101,6 +101,8 @@ public:
     /// Token t's residual after the last layer, (hc, n_embd) on the last stage's GPU, valid until the next `run`.
     const float* final_R(int t) const;
     const float* final_R_all() const { return stages_.back().R_; }
+    /// The head's logits of the last `run`'s first T tokens, T x n_vocab floats copied to `out`.
+    bool head_logits(int T, float* out, std::string& err) const;
 
     /// The GPU plan the pool writes each layer (VRAM hits + the PCIe share of the misses); give it to the
     /// dispatch (`ExpertDispatch::plan`) before the first `run`.

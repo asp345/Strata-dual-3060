@@ -335,6 +335,18 @@ const float* Verifier::final_R(int t) const {
     return stages_.back().R_ + (size_t) t * (size_t) (g_->hc * g_->n_embd);
 }
 
+bool Verifier::head_logits(int T, float* out, std::string& err) const {
+    const Part& L = stages_.back();
+    DeviceGuard dg(L.device);
+    if (cudaStreamSynchronize(L.cs) != cudaSuccess ||
+        cudaMemcpy(out, L.head_logits_, (size_t) T * (size_t) n_vocab_ * sizeof(float), cudaMemcpyDeviceToHost) !=
+            cudaSuccess) {
+        err = "verify: reading the head logits failed";
+        return false;
+    }
+    return true;
+}
+
 Verifier::Part& Verifier::part_of(int64_t layer) {
     for (Part& P : stages_)
         if (layer < P.l1) return P;
