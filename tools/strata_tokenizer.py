@@ -106,6 +106,7 @@ class Tokenizer:
                 if ty in (3, 4):
                     self.special_tokens[tokens[i]] = i
         always = [t for t, i in self.special_tokens.items() if token_types and token_types[i] == 4]
+        self.control_tokens = [t for t, i in self.special_tokens.items() if token_types[i] == 3]
         # Longest literal first, or `<|im_end|>` could match a shorter prefix of itself.  `regex.escape` so a
         # token containing regex metacharacters (several do: `<|`, `[`, `(`) is matched literally.
         self._always_re = self._alt(always)
@@ -166,8 +167,9 @@ class Tokenizer:
                 out.append(i)
         return out
 
-    def _encode_matching(self, text: str, pat) -> list[int]:
-        """Encode `text`, emitting any literal `pat` matches as single tokens and BPE-ing the rest.
+    def _encode_matching(self, text: str, pat, plain_at=()) -> list[int]:
+        """Encode `text`, emitting any literal `pat` matches as single tokens and BPE-ing the rest; a match that
+        starts at a position in `plain_at` stays text.
 
         The split happens on the RAW text, before the byte mapping, because a special token's string is a
         literal to match rather than bytes to decompose.  Everything between the matches is tokenized
@@ -178,6 +180,8 @@ class Tokenizer:
         out: list[int] = []
         pos = 0
         for m in pat.finditer(text):
+            if m.start() in plain_at:
+                continue
             if m.start() > pos:
                 out.extend(self._encode_plain(text[pos:m.start()]))
             out.append(self.special_tokens[m.group(0)])
@@ -186,13 +190,14 @@ class Tokenizer:
             out.extend(self._encode_plain(text[pos:]))
         return out
 
-    def encode(self, text: str, parse_special: bool = False) -> list[int]:
+    def encode(self, text: str, parse_special: bool = False, plain_at=()) -> list[int]:
         """Tokenize `text`.
 
         `parse_special` controls only the type-3 CONTROL literals such as `<|im_end|>`; the type-4
-        USER_DEFINED ones such as `<think>` are matched either way.  See the note in `__init__`.
+        USER_DEFINED ones such as `<think>` are matched either way.  See the note in `__init__`.  A CONTROL
+        literal that starts at a position in `plain_at` is text even with `parse_special`.
         """
-        return self._encode_matching(text, self._special_re if parse_special else self._always_re)
+        return self._encode_matching(text, self._special_re if parse_special else self._always_re, plain_at)
 
     def token_bytes(self, i: int) -> bytes:
         """The raw bytes of one token (a multi-byte character can be split across tokens)."""

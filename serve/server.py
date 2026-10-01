@@ -28,6 +28,7 @@ import hmac
 import json
 import os
 import queue
+import re
 import subprocess
 import sys
 import tempfile
@@ -482,12 +483,13 @@ def child_env(cfg: dict) -> dict:
 class ByteTokenizer:
     """Tiny stand-in tokenizer for tests without the pack: one id per UTF-8 byte, specials as ids >= 256."""
     SPECIALS = ["<|im_start|>", "<|im_end|>", "<|endoftext|>", "<|vision_start|>", "<|image_pad|>", "<|vision_end|>"]
+    control_tokens = SPECIALS
 
-    def encode(self, text, parse_special=False):
+    def encode(self, text, parse_special=False, plain_at=()):
         out, i = [], 0
         while i < len(text):
             for k, s in enumerate(self.SPECIALS):
-                if parse_special and text.startswith(s, i):
+                if parse_special and i not in plain_at and text.startswith(s, i):
                     out.append(256 + k)
                     i += len(s)
                     break
@@ -504,6 +506,40 @@ class ByteTokenizer:
 
 
 # ------------------------------------------------------------------------------------------------ core
+PLACEHOLDER0 = 0xF0000      # the first of the private-use characters that stand for a control token's text
+
+
+def mask_controls(obj, controls):
+    """`obj` (the messages, the tools) with every control token's text in its strings (`<|im_start|>` in a file an
+    agent reads) replaced by one private-use character, so the template's own control tokens are the only ones in
+    the rendered prompt."""
+    if isinstance(obj, str):
+        for k, c in enumerate(controls):
+            if c in obj:
+                obj = obj.replace(c, chr(PLACEHOLDER0 + k))
+        return obj
+    if isinstance(obj, list):
+        return [mask_controls(x, controls) for x in obj]
+    if isinstance(obj, dict):
+        return {k: mask_controls(v, controls) for k, v in obj.items()}
+    return obj
+
+
+def unmask_controls(text, controls):
+    """-> (the rendered prompt with the texts put back, the positions where they start: tokenized as text)."""
+    out, plain_at, at, pos = [], set(), 0, 0
+    for m in re.finditer("[%s-%s]" % (chr(PLACEHOLDER0), chr(PLACEHOLDER0 + len(controls) - 1)), text) if controls else ():
+        out.append(text[pos:m.start()])
+        at += m.start() - pos
+        plain_at.add(at)
+        c = controls[ord(m.group()) - PLACEHOLDER0]
+        out.append(c)
+        at += len(c)
+        pos = m.end()
+    out.append(text[pos:])
+    return "".join(out), plain_at
+
+
 class Detokenizer:
     """Incremental decode: re-decode the generated ids and emit only the new, complete suffix (a multi-byte
     character split across tokens is held until complete)."""
@@ -659,8 +695,10 @@ class Service:
     def prepare(self, messages, tools, kwargs, max_new=None):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context."""
-        prompt = self.template.render(messages, tools=tools, **kwargs)
-        ids = self.tok.encode(prompt, parse_special=True)
+        controls = self.tok.control_tokens
+        prompt, plain_at = unmask_controls(self.template.render(mask_controls(messages, controls),
+                                                                tools=mask_controls(tools, controls), **kwargs), controls)
+        ids = self.tok.encode(prompt, parse_special=True, plain_at=plain_at)
         self.embeddings.path = None
         images = images_of(messages)
         if images:
