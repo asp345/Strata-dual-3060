@@ -188,10 +188,11 @@ struct Stager {
                 const int j = claim(seen);
                 if (j < 0) { active.fetch_sub(1, std::memory_order_acq_rel); break; }
                 const int b = j % kRing;
-                if (j >= kRing) {
+                if (j >= kRing)
                     while (issued.load(std::memory_order_acquire) <= j - kRing) std::this_thread::yield();
-                    cudaEventSynchronize(dma_done[b]);
-                }
+                // the buffer's last DMA: this run's job j - kRing, or for the first kRing jobs the previous run's (a
+                // stage that is not the last does not wait for its copy stream at a chunk's end)
+                cudaEventSynchronize(dma_done[b]);
                 std::memcpy(buf[b], jobs[(size_t) j].src, jobs[(size_t) j].bytes);
                 ready[(size_t) j].store(1, std::memory_order_release);
                 active.fetch_sub(1, std::memory_order_acq_rel);
